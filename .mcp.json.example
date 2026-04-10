@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "redmine": {
+      "command": "node",
+      "args": ["dist/index.js"],
+      "env": {
+        "REDMINE_BASE_URL": "${REDMINE_BASE_URL}",
+        "REDMINE_API_KEY": "${REDMINE_API_KEY}",
+        "REDMINE_ALLOWED_PROJECTS": "${REDMINE_ALLOWED_PROJECTS}",
+        "REDMINE_TIMEOUT_MS": "${REDMINE_TIMEOUT_MS}"
+      }
+    }
+  }
+}

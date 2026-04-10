@@ -1,0 +1,32 @@
+{
+  "name": "claude-redmine-mcp",
+  "version": "0.1.0",
+  "description": "Local MCP server for Claude Code backed by the Redmine REST API.",
+  "type": "module",
+  "bin": {
+    "redmine-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "mcp",
+    "redmine",
+    "claude-code"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "dotenv": "^17.0.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  }
+}
