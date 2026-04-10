@@ -20,7 +20,7 @@ The server is intentionally opinionated:
 
 ## Requirements
 
-- Node.js 18+
+- Node.js 18+ (or Docker)
 - Redmine instance with REST API enabled
 - A personal Redmine API key
 - Claude Code with local MCP support
@@ -33,6 +33,33 @@ npm install
 cp .env.example .env        # edit with your Redmine credentials
 cp .mcp.json.example .mcp.json  # edit with your Redmine credentials
 npm run build
+```
+
+## Docker
+
+Build the image:
+
+```bash
+docker build -t redmine-mcp .
+```
+
+Run via stdio (pass your Redmine credentials as environment variables):
+
+```bash
+docker run -i --rm \
+  -e REDMINE_BASE_URL=https://redmine.example.com/redmine \
+  -e REDMINE_API_KEY=your-api-key \
+  -e REDMINE_ALLOWED_PROJECTS=project1,project2 \
+  redmine-mcp
+```
+
+### Docker MCP Toolkit
+
+This server is available in the [Docker MCP Catalog](https://hub.docker.com/mcp). To use it with Docker Desktop:
+
+```bash
+docker mcp server enable redmine-mcp
+docker mcp gateway run
 ```
 
 ## Environment variables
