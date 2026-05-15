@@ -200,4 +200,73 @@ describe("RedmineService", () => {
     expect(client.uploadAttachment).not.toHaveBeenCalled();
     expect(client.updateIssue).not.toHaveBeenCalled();
   });
+
+  it("dry-runs resolve_chain_with_attachment across all 3 chain issues", async () => {
+    const issues = new Map<number, RedmineIssue>([
+      [
+        278929,
+        issue({
+          id: 278929,
+          project: rossmannProject,
+          tracker: { id: 1, name: "Test" },
+          subject: "TEST",
+          relations: [{ id: 1, relation_type: "copied_to", issue_id: 272676, issue_to_id: 278929 }]
+        })
+      ],
+      [
+        272676,
+        issue({
+          id: 272676,
+          project: rossmannProject,
+          tracker: { id: 2, name: "Błąd" },
+          subject: "same-project",
+          relations: [
+            { id: 1, relation_type: "copied_to", issue_id: 272676, issue_to_id: 278929 },
+            { id: 2, relation_type: "copied_to", issue_id: 268038, issue_to_id: 272676 }
+          ]
+        })
+      ],
+      [
+        268038,
+        issue({
+          id: 268038,
+          project: poligonProject,
+          tracker: { id: 2, name: "Błąd" },
+          subject: "external",
+          relations: [{ id: 2, relation_type: "copied_to", issue_id: 268038, issue_to_id: 272676 }]
+        })
+      ]
+    ]);
+    const client = {
+      getBaseUrl: () => "https://redmine.example.com",
+      getIssue: vi.fn(async (issueId: number) => issues.get(issueId)),
+      getProject: vi.fn(async (projectRef: string) => {
+        if (projectRef === "1" || projectRef === "rossmannmerge") return rossmannProject;
+        if (projectRef === "2" || projectRef === "poligon") return poligonProject;
+        throw new Error(`Unknown project ${projectRef}`);
+      }),
+      getStatus: vi.fn(),
+      uploadAttachment: vi.fn(),
+      updateIssue: vi.fn()
+    };
+    const fakeFs = vi.fn(async () => new Uint8Array([5, 5, 5, 5, 5]));
+    const service = new RedmineService(client as never, ["rossmannmerge", "poligon"], ["poligon"], fakeFs);
+
+    const result = await service.resolveChainWithAttachment({
+      test_issue_id: 278929,
+      file_path: "/tmp/report.pdf",
+      note: "Wersja 1.30"
+    });
+
+    expect(result.dry_run).toBe(true);
+    expect(result.status).toBe("Rozwiązany");
+    expect(result.attachment).toEqual({ filename: "report.pdf", content_type: "application/pdf", size: 5 });
+    expect(result.steps.map((step) => [step.role, step.issue.id, step.action])).toEqual([
+      ["test", 278929, "would_update_with_attachment"],
+      ["same_project_issue", 272676, "would_update_with_attachment"],
+      ["external_issue", 268038, "would_update_with_attachment"]
+    ]);
+    expect(client.uploadAttachment).not.toHaveBeenCalled();
+    expect(client.updateIssue).not.toHaveBeenCalled();
+  });
 });

@@ -202,3 +202,19 @@ export interface AttachFileToChainResult {
   external_projects: string[];
   steps: AttachFileToChainStep[];
 }
+
+export interface ResolveChainWithAttachmentStep {
+  issue: NormalizedIssueSummary;
+  role: "test" | "same_project_issue" | "external_issue";
+  target_status: string;
+  action: "would_update_with_attachment" | "updated_with_attachment";
+}
+
+export interface ResolveChainWithAttachmentResult {
+  dry_run: boolean;
+  note: string;
+  status: string;
+  attachment: AttachmentDescriptor;
+  external_projects: string[];
+  steps: ResolveChainWithAttachmentStep[];
+}

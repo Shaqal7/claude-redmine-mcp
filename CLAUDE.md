@@ -55,6 +55,7 @@ Redmine attachments are a two-step flow: `POST /uploads.json` with raw bytes + f
 - `file_path` is read on the MCP server's filesystem via `fs/promises.readFile` (injected as `readFileImpl` for testability). The server has no remote upload — the user must place the file where the server can see it. In Docker, that means a volume mount.
 - Content type is detected from extension via `CONTENT_TYPE_BY_EXTENSION` in `src/service.ts`, fallback `application/octet-stream`.
 - `attach_file_to_test_chain` reuses the same chain traversal as `resolve_related_test_chain` (test → same-project → external) but **only attaches to test + external**. The same-project issue is required for topology resolution but not modified.
+- `resolve_chain_with_attachment` is the combined variant: one PUT per chain issue carrying `{ status_id, notes, uploads }` so each of the three issues gets a single journal entry (status change + note + attachment together). All three chain issues receive the attachment in this variant. The chain traversal is shared via the `findTestChain` helper in `src/service.ts`.
 
 ## Configuration (required env)
 

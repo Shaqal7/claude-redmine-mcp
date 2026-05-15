@@ -12,6 +12,7 @@ import type {
   NormalizedIssueDetail,
   ProjectRef,
   RedmineIssue,
+  ResolveChainWithAttachmentResult,
   ResolveRelatedTestChainResult,
   SearchIssuesResult
 } from "./types.js";
@@ -250,25 +251,7 @@ export class RedmineService {
     const externalProjects = normalizeExternalProjects(input.external_projects, this.defaultExternalProjects);
     const dryRun = input.dry_run ?? true;
 
-    const testIssue = await this.getAuthorizedIssue(input.test_issue_id);
-    const testProject = await this.client.getProject(String(testIssue.project.id));
-    const sameProjectIssue = await this.findSingleRelatedIssue(
-      testIssue,
-      (candidate, candidateProject) =>
-        candidate.id !== testIssue.id &&
-        candidateProject.id === testProject.id &&
-        candidate.tracker?.name.trim().toLowerCase() !== "test",
-      `Expected exactly one non-test related issue in project "${testProject.name}".`
-    );
-    const externalIssue = await this.findSingleRelatedIssue(
-      sameProjectIssue,
-      (candidate, candidateProject) =>
-        candidate.id !== testIssue.id &&
-        candidate.id !== sameProjectIssue.id &&
-        candidateProject.id !== testProject.id &&
-        externalProjects.some((projectRef) => projectMatches(candidateProject, projectRef)),
-      `Expected exactly one related issue in one of external projects: ${externalProjects.join(", ")}.`
-    );
+    const { testIssue, externalIssue } = await this.findTestChain(input.test_issue_id, externalProjects);
 
     const targets = [
       { role: "test" as const, issue: testIssue },
@@ -369,24 +352,9 @@ export class RedmineService {
     const externalProjects = normalizeExternalProjects(input.external_projects, this.defaultExternalProjects);
     const dryRun = input.dry_run ?? true;
 
-    const testIssue = await this.getAuthorizedIssue(input.test_issue_id);
-    const testProject = await this.client.getProject(String(testIssue.project.id));
-    const sameProjectIssue = await this.findSingleRelatedIssue(
-      testIssue,
-      (candidate, candidateProject) =>
-        candidate.id !== testIssue.id &&
-        candidateProject.id === testProject.id &&
-        candidate.tracker?.name.trim().toLowerCase() !== "test",
-      `Expected exactly one non-test related issue in project "${testProject.name}".`
-    );
-    const externalIssue = await this.findSingleRelatedIssue(
-      sameProjectIssue,
-      (candidate, candidateProject) =>
-        candidate.id !== testIssue.id &&
-        candidate.id !== sameProjectIssue.id &&
-        candidateProject.id !== testProject.id &&
-        externalProjects.some((projectRef) => projectMatches(candidateProject, projectRef)),
-      `Expected exactly one related issue in one of external projects: ${externalProjects.join(", ")}.`
+    const { testIssue, sameProjectIssue, externalIssue } = await this.findTestChain(
+      input.test_issue_id,
+      externalProjects
     );
 
     const chain = [
@@ -437,6 +405,103 @@ export class RedmineService {
     };
   }
 
+  public async resolveChainWithAttachment(input: {
+    test_issue_id: number;
+    file_path: string;
+    note: string;
+    status?: string;
+    external_projects?: string[];
+    dry_run?: boolean;
+  }): Promise<ResolveChainWithAttachmentResult> {
+    const note = input.note.trim();
+    if (!note) {
+      throw new RedmineMcpError("VALIDATION_ERROR", "Note must not be empty.");
+    }
+    const filePath = input.file_path.trim();
+    if (!filePath) {
+      throw new RedmineMcpError("VALIDATION_ERROR", "file_path must not be empty.");
+    }
+
+    const status = input.status?.trim() || DEFAULT_RESOLVE_STATUS;
+    const externalProjects = normalizeExternalProjects(input.external_projects, this.defaultExternalProjects);
+    const dryRun = input.dry_run ?? true;
+
+    const { testIssue, sameProjectIssue, externalIssue } = await this.findTestChain(
+      input.test_issue_id,
+      externalProjects
+    );
+
+    const chain = [
+      { role: "test" as const, issue: testIssue },
+      { role: "same_project_issue" as const, issue: sameProjectIssue },
+      { role: "external_issue" as const, issue: externalIssue }
+    ];
+
+    const attachment = await this.readAttachment(filePath);
+    const attachmentDescriptor: AttachmentDescriptor = {
+      filename: attachment.filename,
+      content_type: attachment.contentType,
+      size: attachment.bytes.byteLength
+    };
+
+    if (!dryRun) {
+      const completed: string[] = [];
+      for (const step of chain) {
+        try {
+          const targetStatus = await this.client.getStatus(status, step.issue.allowed_statuses);
+          const token = await this.client.uploadAttachment(attachment.filename, attachment.bytes);
+          await this.client.updateIssue(step.issue.id, {
+            status_id: targetStatus.id,
+            notes: note,
+            uploads: [
+              { token, filename: attachment.filename, content_type: attachment.contentType }
+            ]
+          });
+          const updated = await this.getAuthorizedIssue(step.issue.id);
+          if (updated.status.id !== targetStatus.id) {
+            throw new RedmineMcpError(
+              "UPSTREAM_ERROR",
+              `Redmine did not persist the requested status change to "${targetStatus.name}" for #${step.issue.id}.`
+            );
+          }
+          completed.push(`#${step.issue.id} (${step.role})`);
+        } catch (error) {
+          const partial = completed.length > 0
+            ? ` Already updated before failure: ${completed.join(", ")}. Chain is now in a partially-resolved state and must be reconciled manually.`
+            : "";
+          const reason = error instanceof Error ? error.message : String(error);
+          throw new RedmineMcpError(
+            "UPSTREAM_ERROR",
+            `Failed to update #${step.issue.id} (${step.role}) with attachment: ${reason}.${partial}`
+          );
+        }
+      }
+    }
+
+    const refreshedChain = dryRun
+      ? chain
+      : await Promise.all(
+          chain.map(async (step) => ({
+            role: step.role,
+            issue: await this.getAuthorizedIssue(step.issue.id)
+          }))
+        );
+
+    return {
+      dry_run: dryRun,
+      note,
+      status,
+      attachment: attachmentDescriptor,
+      external_projects: externalProjects,
+      steps: refreshedChain.map((step) => ({
+        role: step.role,
+        target_status: status,
+        action: dryRun ? "would_update_with_attachment" : "updated_with_attachment",
+        issue: normalizeIssueSummary(step.issue, this.client.getBaseUrl())
+      }))
+    };
+  }
+
   private async getAuthorizedIssue(issueId: number) {
     const issue = await this.client.getIssue(issueId, ["journals", "relations", "allowed_statuses"]);
     const project = await this.client.getProject(String(issue.project.id));
@@ -469,6 +534,32 @@ export class RedmineService {
       matches.length === 0 ? "NOT_FOUND" : "VALIDATION_ERROR",
       `${errorPrefix} Related issue candidates: ${relatedList}.`
     );
+  }
+
+  private async findTestChain(
+    testIssueId: number,
+    externalProjects: string[]
+  ): Promise<{ testIssue: RedmineIssue; sameProjectIssue: RedmineIssue; externalIssue: RedmineIssue }> {
+    const testIssue = await this.getAuthorizedIssue(testIssueId);
+    const testProject = await this.client.getProject(String(testIssue.project.id));
+    const sameProjectIssue = await this.findSingleRelatedIssue(
+      testIssue,
+      (candidate, candidateProject) =>
+        candidate.id !== testIssue.id &&
+        candidateProject.id === testProject.id &&
+        candidate.tracker?.name.trim().toLowerCase() !== "test",
+      `Expected exactly one non-test related issue in project "${testProject.name}".`
+    );
+    const externalIssue = await this.findSingleRelatedIssue(
+      sameProjectIssue,
+      (candidate, candidateProject) =>
+        candidate.id !== testIssue.id &&
+        candidate.id !== sameProjectIssue.id &&
+        candidateProject.id !== testProject.id &&
+        externalProjects.some((projectRef) => projectMatches(candidateProject, projectRef)),
+      `Expected exactly one related issue in one of external projects: ${externalProjects.join(", ")}.`
+    );
+    return { testIssue, sameProjectIssue, externalIssue };
   }
 
   private async resolveIssueWithNote(issue: RedmineIssue, status: string, note: string): Promise<void> {

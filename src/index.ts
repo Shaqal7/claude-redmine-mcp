@@ -94,6 +94,19 @@ server.registerTool("attach_file_to_issue", {
   }
 }, handlers.attachFileToIssue);
 
+server.registerTool("resolve_chain_with_attachment", {
+  description:
+    "Resolve the full test chain (test -> same_project_issue -> external_issue) with the same note and status while attaching a file to ALL THREE issues in a single PUT per issue — producing one combined journal entry per issue (status change + comment + attachment). Use this instead of pairing resolve_related_test_chain with attach_file_to_test_chain when you want a clean history. The file is uploaded once per target (Redmine tokens are single-use). Defaults to dry_run=true; use dry_run=false only after explicit user confirmation. Not atomic: if a later step fails, earlier steps remain applied and the partial state is reported in the error.",
+  inputSchema: {
+    test_issue_id: z.number().int().positive(),
+    file_path: z.string().min(1),
+    note: z.string().min(1),
+    status: z.string().min(1).optional(),
+    external_projects: z.array(z.string().min(1)).min(1).optional(),
+    dry_run: z.boolean().optional()
+  }
+}, handlers.resolveChainWithAttachment);
+
 server.registerTool("attach_file_to_test_chain", {
   description:
     "Attach a local file to a test issue and to its related external issue (reached via test -> same_project_issue -> external_issue), with the same note on both. The same-project issue itself is NOT touched. The file is uploaded once per target (Redmine upload tokens are single-use). Defaults to dry_run=true; use dry_run=false only after explicit user confirmation. Not atomic: if the second attach fails, the first remains and the partial state is reported in the error.",

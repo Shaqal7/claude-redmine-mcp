@@ -5,3 +5,4 @@ dist/
 .mcp.local.json
 .claude/settings.local.json
 coverage/
+notes/
