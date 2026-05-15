@@ -104,4 +104,100 @@ describe("RedmineService", () => {
     expect(result.steps.every((step) => step.action === "would_update")).toBe(true);
     expect(client.updateIssue).not.toHaveBeenCalled();
   });
+
+  it("attaches a file to a single issue with a note", async () => {
+    const issueRecord = issue({
+      id: 278929,
+      project: rossmannProject,
+      subject: "TEST: filter issue"
+    });
+    const client = {
+      getBaseUrl: () => "https://redmine.example.com",
+      getIssue: vi.fn(async () => issueRecord),
+      getProject: vi.fn(async () => rossmannProject),
+      uploadAttachment: vi.fn(async () => "token-abc"),
+      updateIssue: vi.fn()
+    };
+    const fakeFs = vi.fn(async () => new Uint8Array([1, 2, 3, 4]));
+    const service = new RedmineService(client as never, ["rossmannmerge"], ["rossmannmerge"], fakeFs);
+
+    await service.attachFileToIssue({
+      issue_id: 278929,
+      file_path: "/tmp/report.pdf",
+      note: "Załączam raport"
+    });
+
+    expect(fakeFs).toHaveBeenCalledWith("/tmp/report.pdf");
+    expect(client.uploadAttachment).toHaveBeenCalledWith("report.pdf", expect.any(Uint8Array));
+    expect(client.updateIssue).toHaveBeenCalledWith(278929, {
+      uploads: [{ token: "token-abc", filename: "report.pdf", content_type: "application/pdf" }],
+      notes: "Załączam raport"
+    });
+  });
+
+  it("attaches a file to the test+external chain in dry-run without calling upload or update", async () => {
+    const issues = new Map<number, RedmineIssue>([
+      [
+        278929,
+        issue({
+          id: 278929,
+          project: rossmannProject,
+          tracker: { id: 1, name: "Test" },
+          subject: "TEST",
+          relations: [{ id: 1, relation_type: "copied_to", issue_id: 272676, issue_to_id: 278929 }]
+        })
+      ],
+      [
+        272676,
+        issue({
+          id: 272676,
+          project: rossmannProject,
+          tracker: { id: 2, name: "Błąd" },
+          subject: "same-project",
+          relations: [
+            { id: 1, relation_type: "copied_to", issue_id: 272676, issue_to_id: 278929 },
+            { id: 2, relation_type: "copied_to", issue_id: 268038, issue_to_id: 272676 }
+          ]
+        })
+      ],
+      [
+        268038,
+        issue({
+          id: 268038,
+          project: poligonProject,
+          tracker: { id: 2, name: "Błąd" },
+          subject: "external",
+          relations: [{ id: 2, relation_type: "copied_to", issue_id: 268038, issue_to_id: 272676 }]
+        })
+      ]
+    ]);
+    const client = {
+      getBaseUrl: () => "https://redmine.example.com",
+      getIssue: vi.fn(async (issueId: number) => issues.get(issueId)),
+      getProject: vi.fn(async (projectRef: string) => {
+        if (projectRef === "1" || projectRef === "rossmannmerge") return rossmannProject;
+        if (projectRef === "2" || projectRef === "poligon") return poligonProject;
+        throw new Error(`Unknown project ${projectRef}`);
+      }),
+      uploadAttachment: vi.fn(),
+      updateIssue: vi.fn()
+    };
+    const fakeFs = vi.fn(async () => new Uint8Array([9, 9, 9]));
+    const service = new RedmineService(client as never, ["rossmannmerge", "poligon"], ["poligon"], fakeFs);
+
+    const result = await service.attachFileToTestChain({
+      test_issue_id: 278929,
+      file_path: "/tmp/screenshot.png",
+      note: "Załączam dowód"
+    });
+
+    expect(result.dry_run).toBe(true);
+    expect(result.attachment).toEqual({ filename: "screenshot.png", content_type: "image/png", size: 3 });
+    expect(result.steps.map((step) => [step.role, step.issue.id, step.action])).toEqual([
+      ["test", 278929, "would_attach"],
+      ["external_issue", 268038, "would_attach"]
+    ]);
+    expect(client.uploadAttachment).not.toHaveBeenCalled();
+    expect(client.updateIssue).not.toHaveBeenCalled();
+  });
 });

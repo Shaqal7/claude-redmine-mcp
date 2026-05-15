@@ -84,6 +84,28 @@ server.registerTool("resolve_related_test_chain", {
   }
 }, handlers.resolveRelatedTestChain);
 
+server.registerTool("attach_file_to_issue", {
+  description:
+    "Attach a local file to a Redmine issue, optionally with a note. The file_path is read from the MCP server's filesystem (absolute path or relative to the server's working directory). Only call this after explicit user confirmation.",
+  inputSchema: {
+    issue_id: z.number().int().positive(),
+    file_path: z.string().min(1),
+    note: z.string().min(1).optional()
+  }
+}, handlers.attachFileToIssue);
+
+server.registerTool("attach_file_to_test_chain", {
+  description:
+    "Attach a local file to a test issue and to its related external issue (reached via test -> same_project_issue -> external_issue), with the same note on both. The same-project issue itself is NOT touched. The file is uploaded once per target (Redmine upload tokens are single-use). Defaults to dry_run=true; use dry_run=false only after explicit user confirmation. Not atomic: if the second attach fails, the first remains and the partial state is reported in the error.",
+  inputSchema: {
+    test_issue_id: z.number().int().positive(),
+    file_path: z.string().min(1),
+    note: z.string().min(1),
+    external_projects: z.array(z.string().min(1)).min(1).optional(),
+    dry_run: z.boolean().optional()
+  }
+}, handlers.attachFileToTestChain);
+
 const transport = new StdioServerTransport();
 
 try {

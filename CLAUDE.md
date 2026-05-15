@@ -48,6 +48,14 @@ The updates are **not atomic**. The for-loop in `resolveRelatedTestChain` catche
 
 The external issue must be reachable from the same-project issue, **not directly from the test issue**. This is by design — if the topology assumption changes, the description in `src/index.ts` must change too.
 
+### File attachments (`attach_file_to_issue`, `attach_file_to_test_chain`)
+
+Redmine attachments are a two-step flow: `POST /uploads.json` with raw bytes + filename in querystring → token, then `PUT /issues/{id}.json` with `uploads: [{ token, filename, content_type }]`. **Tokens are single-use** — for the chain variant we upload separately for each target.
+
+- `file_path` is read on the MCP server's filesystem via `fs/promises.readFile` (injected as `readFileImpl` for testability). The server has no remote upload — the user must place the file where the server can see it. In Docker, that means a volume mount.
+- Content type is detected from extension via `CONTENT_TYPE_BY_EXTENSION` in `src/service.ts`, fallback `application/octet-stream`.
+- `attach_file_to_test_chain` reuses the same chain traversal as `resolve_related_test_chain` (test → same-project → external) but **only attaches to test + external**. The same-project issue is required for topology resolution but not modified.
+
 ## Configuration (required env)
 
 | Var | Notes |

@@ -1,7 +1,12 @@
+import { readFile } from "node:fs/promises";
+import { basename, extname } from "node:path";
+
 import { RedmineMcpError } from "./errors.js";
 import { normalizeIssueDetail, normalizeIssueSummary } from "./redmine/normalize.js";
 import { ProjectPolicy } from "./redmine/policy.js";
 import type {
+  AttachFileToChainResult,
+  AttachmentDescriptor,
   ListIssuesResult,
   NamedRef,
   NormalizedIssueDetail,
@@ -12,6 +17,8 @@ import type {
 } from "./types.js";
 import { RedmineClient } from "./redmine/client.js";
 
+type FileReader = (filePath: string) => Promise<Uint8Array>;
+
 const SEARCH_PAGE_SIZE = 10;
 const MAX_SEARCH_SCAN = 100;
 const DEFAULT_RESOLVE_STATUS = "Rozwiązany";
@@ -19,11 +26,13 @@ const DEFAULT_RESOLVE_STATUS = "Rozwiązany";
 export class RedmineService {
   private readonly policy: ProjectPolicy;
   private readonly defaultExternalProjects: string[];
+  private readonly readFileImpl: FileReader;
 
   public constructor(
     private readonly client: RedmineClient,
     allowedProjects: string[],
-    defaultExternalProjects: string[]
+    defaultExternalProjects: string[],
+    readFileImpl: FileReader = (filePath) => readFile(filePath).then((buffer) => new Uint8Array(buffer))
   ) {
     if (!defaultExternalProjects || defaultExternalProjects.length === 0) {
       throw new RedmineMcpError(
@@ -33,6 +42,7 @@ export class RedmineService {
     }
     this.policy = new ProjectPolicy(allowedProjects);
     this.defaultExternalProjects = defaultExternalProjects;
+    this.readFileImpl = readFileImpl;
   }
 
   public async listIssues(input: {
@@ -192,6 +202,155 @@ export class RedmineService {
     }
 
     return normalizeIssueDetail(updated, this.client.getBaseUrl());
+  }
+
+  public async attachFileToIssue(input: {
+    issue_id: number;
+    file_path: string;
+    note?: string;
+  }): Promise<NormalizedIssueDetail> {
+    const filePath = input.file_path.trim();
+    if (!filePath) {
+      throw new RedmineMcpError("VALIDATION_ERROR", "file_path must not be empty.");
+    }
+    const note = input.note?.trim();
+
+    await this.getAuthorizedIssue(input.issue_id);
+    const { filename, contentType, bytes } = await this.readAttachment(filePath);
+    const token = await this.client.uploadAttachment(filename, bytes);
+
+    const patch: Record<string, unknown> = {
+      uploads: [{ token, filename, content_type: contentType }]
+    };
+    if (note) {
+      patch.notes = note;
+    }
+
+    await this.client.updateIssue(input.issue_id, patch);
+    const updated = await this.getAuthorizedIssue(input.issue_id);
+    return normalizeIssueDetail(updated, this.client.getBaseUrl());
+  }
+
+  public async attachFileToTestChain(input: {
+    test_issue_id: number;
+    file_path: string;
+    note: string;
+    external_projects?: string[];
+    dry_run?: boolean;
+  }): Promise<AttachFileToChainResult> {
+    const note = input.note.trim();
+    if (!note) {
+      throw new RedmineMcpError("VALIDATION_ERROR", "Note must not be empty.");
+    }
+    const filePath = input.file_path.trim();
+    if (!filePath) {
+      throw new RedmineMcpError("VALIDATION_ERROR", "file_path must not be empty.");
+    }
+
+    const externalProjects = normalizeExternalProjects(input.external_projects, this.defaultExternalProjects);
+    const dryRun = input.dry_run ?? true;
+
+    const testIssue = await this.getAuthorizedIssue(input.test_issue_id);
+    const testProject = await this.client.getProject(String(testIssue.project.id));
+    const sameProjectIssue = await this.findSingleRelatedIssue(
+      testIssue,
+      (candidate, candidateProject) =>
+        candidate.id !== testIssue.id &&
+        candidateProject.id === testProject.id &&
+        candidate.tracker?.name.trim().toLowerCase() !== "test",
+      `Expected exactly one non-test related issue in project "${testProject.name}".`
+    );
+    const externalIssue = await this.findSingleRelatedIssue(
+      sameProjectIssue,
+      (candidate, candidateProject) =>
+        candidate.id !== testIssue.id &&
+        candidate.id !== sameProjectIssue.id &&
+        candidateProject.id !== testProject.id &&
+        externalProjects.some((projectRef) => projectMatches(candidateProject, projectRef)),
+      `Expected exactly one related issue in one of external projects: ${externalProjects.join(", ")}.`
+    );
+
+    const targets = [
+      { role: "test" as const, issue: testIssue },
+      { role: "external_issue" as const, issue: externalIssue }
+    ];
+
+    const attachment = await this.readAttachment(filePath);
+    const attachmentDescriptor: AttachmentDescriptor = {
+      filename: attachment.filename,
+      content_type: attachment.contentType,
+      size: attachment.bytes.byteLength
+    };
+
+    if (!dryRun) {
+      const completed: string[] = [];
+      for (const target of targets) {
+        try {
+          const token = await this.client.uploadAttachment(attachment.filename, attachment.bytes);
+          await this.client.updateIssue(target.issue.id, {
+            notes: note,
+            uploads: [
+              { token, filename: attachment.filename, content_type: attachment.contentType }
+            ]
+          });
+          completed.push(`#${target.issue.id} (${target.role})`);
+        } catch (error) {
+          const partial = completed.length > 0
+            ? ` Already attached before failure: ${completed.join(", ")}. Chain is now in a partially-attached state and must be reconciled manually.`
+            : "";
+          const reason = error instanceof Error ? error.message : String(error);
+          throw new RedmineMcpError(
+            "UPSTREAM_ERROR",
+            `Failed to attach file to #${target.issue.id} (${target.role}): ${reason}.${partial}`
+          );
+        }
+      }
+    }
+
+    const refreshed = dryRun
+      ? targets
+      : await Promise.all(
+          targets.map(async (target) => ({
+            role: target.role,
+            issue: await this.getAuthorizedIssue(target.issue.id)
+          }))
+        );
+
+    return {
+      dry_run: dryRun,
+      note,
+      attachment: attachmentDescriptor,
+      external_projects: externalProjects,
+      steps: refreshed.map((target) => ({
+        role: target.role,
+        action: dryRun ? "would_attach" : "attached",
+        issue: normalizeIssueSummary(target.issue, this.client.getBaseUrl())
+      }))
+    };
+  }
+
+  private async readAttachment(filePath: string): Promise<{
+    filename: string;
+    contentType: string;
+    bytes: Uint8Array;
+  }> {
+    let bytes: Uint8Array;
+    try {
+      bytes = await this.readFileImpl(filePath);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new RedmineMcpError("VALIDATION_ERROR", `Unable to read file "${filePath}": ${reason}.`);
+    }
+
+    if (bytes.byteLength === 0) {
+      throw new RedmineMcpError("VALIDATION_ERROR", `File "${filePath}" is empty.`);
+    }
+
+    return {
+      filename: basename(filePath),
+      contentType: contentTypeForExtension(extname(filePath)),
+      bytes
+    };
   }
 
   public async resolveRelatedTestChain(input: {
@@ -452,6 +611,34 @@ function normalizeExternalProjects(projects: string[] | undefined, fallback: str
   }
 
   return [...new Set(normalized)];
+}
+
+const CONTENT_TYPE_BY_EXTENSION: Record<string, string> = {
+  ".txt": "text/plain",
+  ".log": "text/plain",
+  ".md": "text/markdown",
+  ".csv": "text/csv",
+  ".json": "application/json",
+  ".xml": "application/xml",
+  ".html": "text/html",
+  ".pdf": "application/pdf",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".svg": "image/svg+xml",
+  ".zip": "application/zip",
+  ".gz": "application/gzip",
+  ".tar": "application/x-tar",
+  ".doc": "application/msword",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xls": "application/vnd.ms-excel",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+};
+
+function contentTypeForExtension(extension: string): string {
+  return CONTENT_TYPE_BY_EXTENSION[extension.toLowerCase()] ?? "application/octet-stream";
 }
 
 function projectMatches(project: ProjectRef, projectRef: string): boolean {

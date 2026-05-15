@@ -36,7 +36,19 @@ export function createToolHandlers(service: RedmineService) {
       status?: string;
       external_projects?: string[];
       dry_run?: boolean;
-    }): Promise<ToolResponse> => handleTool(async () => service.resolveRelatedTestChain(input))
+    }): Promise<ToolResponse> => handleTool(async () => service.resolveRelatedTestChain(input)),
+    attachFileToIssue: async (input: {
+      issue_id: number;
+      file_path: string;
+      note?: string;
+    }): Promise<ToolResponse> => handleTool(async () => service.attachFileToIssue(input)),
+    attachFileToTestChain: async (input: {
+      test_issue_id: number;
+      file_path: string;
+      note: string;
+      external_projects?: string[];
+      dry_run?: boolean;
+    }): Promise<ToolResponse> => handleTool(async () => service.attachFileToTestChain(input))
   };
 }
 

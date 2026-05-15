@@ -178,3 +178,27 @@ export interface ResolveRelatedTestChainResult {
   external_projects: string[];
   steps: ResolveRelatedTestChainStep[];
 }
+
+export interface RedmineUploadResponse {
+  upload: { token: string };
+}
+
+export interface AttachmentDescriptor {
+  filename: string;
+  content_type: string;
+  size: number;
+}
+
+export interface AttachFileToChainStep {
+  issue: NormalizedIssueSummary;
+  role: "test" | "external_issue";
+  action: "would_attach" | "attached";
+}
+
+export interface AttachFileToChainResult {
+  dry_run: boolean;
+  note: string;
+  attachment: AttachmentDescriptor;
+  external_projects: string[];
+  steps: AttachFileToChainStep[];
+}

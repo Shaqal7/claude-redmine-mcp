@@ -10,13 +10,16 @@ import type {
   RedmineMembership,
   RedmineMembershipsResponse,
   RedmineProjectResponse,
-  RedmineStatusesResponse
+  RedmineStatusesResponse,
+  RedmineUploadResponse
 } from "../types.js";
 
 interface RequestOptions {
-  method?: "GET" | "PUT";
+  method?: "GET" | "PUT" | "POST";
   query?: Record<string, string | number | undefined>;
   body?: unknown;
+  rawBody?: Uint8Array;
+  contentType?: string;
 }
 
 type FetchLike = typeof fetch;
@@ -91,6 +94,21 @@ export class RedmineClient {
         issue: issuePatch
       }
     });
+  }
+
+  public async uploadAttachment(filename: string, bytes: Uint8Array): Promise<string> {
+    const response = await this.request<RedmineUploadResponse>("/uploads.json", {
+      method: "POST",
+      query: { filename },
+      rawBody: bytes,
+      contentType: "application/octet-stream"
+    });
+
+    if (!response?.upload?.token) {
+      throw new RedmineMcpError("UPSTREAM_ERROR", "Redmine upload response did not contain a token.");
+    }
+
+    return response.upload.token;
   }
 
   public async listStatuses(): Promise<NamedRef[]> {
@@ -192,14 +210,24 @@ export class RedmineClient {
         }
       }
 
+      const hasRawBody = options.rawBody !== undefined;
+      const headers: Record<string, string> = {
+        "Accept": "application/json",
+        "X-Redmine-API-Key": this.config.redmineApiKey
+      };
+      let body: Uint8Array | string | undefined;
+      if (hasRawBody) {
+        headers["Content-Type"] = options.contentType ?? "application/octet-stream";
+        body = options.rawBody;
+      } else if (options.body !== undefined) {
+        headers["Content-Type"] = "application/json";
+        body = JSON.stringify(options.body);
+      }
+
       const response = await this.fetchImpl(url, {
         method: options.method ?? "GET",
-        headers: {
-          "Accept": "application/json",
-          "Content-Type": "application/json",
-          "X-Redmine-API-Key": this.config.redmineApiKey
-        },
-        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        headers,
+        body,
         signal: controller.signal
       });
 
