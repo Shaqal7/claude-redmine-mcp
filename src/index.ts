@@ -11,7 +11,7 @@ import { createToolHandlers } from "./tool-handlers.js";
 
 const config = loadConfig();
 const client = new RedmineClient(config);
-const service = new RedmineService(client, config.allowedProjects);
+const service = new RedmineService(client, config.allowedProjects, config.defaultExternalProjects);
 const handlers = createToolHandlers(service);
 
 const server = new McpServer({
@@ -71,6 +71,18 @@ server.registerTool("assign_issue", {
     assignee: z.string().min(1)
   }
 }, handlers.assignIssue);
+
+server.registerTool("resolve_related_test_chain", {
+  description:
+    "Resolve a test issue, its related same-project non-test issue, and one external issue related to that same-project issue (not to the test directly) — applying the same note and status to all three. The chain shape is required: test -> same_project_issue -> external_issue. Defaults to dry_run=true; use dry_run=false only after explicit user confirmation. Updates are not atomic: if a later step fails, earlier steps remain applied and the partial state is reported in the error.",
+  inputSchema: {
+    test_issue_id: z.number().int().positive(),
+    note: z.string().min(1),
+    status: z.string().min(1).optional(),
+    external_projects: z.array(z.string().min(1)).min(1).optional(),
+    dry_run: z.boolean().optional()
+  }
+}, handlers.resolveRelatedTestChain);
 
 const transport = new StdioServerTransport();
 

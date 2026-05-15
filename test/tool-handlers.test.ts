@@ -10,7 +10,8 @@ describe("tool handlers", () => {
       getIssue: vi.fn(),
       addIssueNote: vi.fn(),
       updateIssueStatus: vi.fn(),
-      assignIssue: vi.fn()
+      assignIssue: vi.fn(),
+      resolveRelatedTestChain: vi.fn()
     } as never);
 
     const response = await handlers.listIssues({ project: "backend" });
@@ -28,7 +29,8 @@ describe("tool handlers", () => {
       getIssue: vi.fn(),
       addIssueNote: vi.fn(),
       updateIssueStatus: vi.fn(),
-      assignIssue: vi.fn()
+      assignIssue: vi.fn(),
+      resolveRelatedTestChain: vi.fn()
     } as never);
 
     const response = await handlers.listIssues({ project: "backend" });

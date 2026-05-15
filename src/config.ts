@@ -11,6 +11,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const allowedProjects = env.REDMINE_ALLOWED_PROJECTS?.split(",")
     .map((value) => value.trim())
     .filter(Boolean);
+  const defaultExternalProjects = env.REDMINE_DEFAULT_EXTERNAL_PROJECTS?.split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
   const timeoutMs = Number.parseInt(env.REDMINE_TIMEOUT_MS ?? "", 10);
 
   if (!redmineBaseUrl) {
@@ -34,10 +37,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     );
   }
 
+  if (!defaultExternalProjects || defaultExternalProjects.length === 0) {
+    throw new RedmineMcpError(
+      "VALIDATION_ERROR",
+      "Missing REDMINE_DEFAULT_EXTERNAL_PROJECTS environment variable."
+    );
+  }
+
+  const allowedSet = new Set(allowedProjects.map((value) => value.toLowerCase()));
+  const unknownExternals = defaultExternalProjects.filter(
+    (project) => !allowedSet.has(project.toLowerCase())
+  );
+  if (unknownExternals.length > 0) {
+    throw new RedmineMcpError(
+      "VALIDATION_ERROR",
+      `REDMINE_DEFAULT_EXTERNAL_PROJECTS contains projects not present in REDMINE_ALLOWED_PROJECTS: ${unknownExternals.join(", ")}.`
+    );
+  }
+
   return {
     redmineBaseUrl: redmineBaseUrl.replace(/\/+$/, ""),
     redmineApiKey,
     allowedProjects,
+    defaultExternalProjects,
     timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS
   };
 }

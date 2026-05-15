@@ -9,6 +9,7 @@ export interface AppConfig {
   redmineBaseUrl: string;
   redmineApiKey: string;
   allowedProjects: string[];
+  defaultExternalProjects: string[];
   timeoutMs: number;
 }
 
@@ -161,4 +162,19 @@ export interface SearchIssuesResult {
   scanned_issues: number;
   truncated: boolean;
   issues: NormalizedIssueSummary[];
+}
+
+export interface ResolveRelatedTestChainStep {
+  issue: NormalizedIssueSummary;
+  role: "test" | "same_project_issue" | "external_issue";
+  target_status: string;
+  action: "would_update" | "updated";
+}
+
+export interface ResolveRelatedTestChainResult {
+  dry_run: boolean;
+  note: string;
+  status: string;
+  external_projects: string[];
+  steps: ResolveRelatedTestChainStep[];
 }

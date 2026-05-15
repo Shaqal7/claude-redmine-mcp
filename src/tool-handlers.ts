@@ -29,7 +29,14 @@ export function createToolHandlers(service: RedmineService) {
     updateIssueStatus: async (input: { issue_id: number; status: string }): Promise<ToolResponse> =>
       handleTool(async () => service.updateIssueStatus(input.issue_id, input.status)),
     assignIssue: async (input: { issue_id: number; assignee: string }): Promise<ToolResponse> =>
-      handleTool(async () => service.assignIssue(input.issue_id, input.assignee))
+      handleTool(async () => service.assignIssue(input.issue_id, input.assignee)),
+    resolveRelatedTestChain: async (input: {
+      test_issue_id: number;
+      note: string;
+      status?: string;
+      external_projects?: string[];
+      dry_run?: boolean;
+    }): Promise<ToolResponse> => handleTool(async () => service.resolveRelatedTestChain(input))
   };
 }
 

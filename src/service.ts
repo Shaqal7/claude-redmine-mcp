@@ -6,18 +6,33 @@ import type {
   NamedRef,
   NormalizedIssueDetail,
   ProjectRef,
+  RedmineIssue,
+  ResolveRelatedTestChainResult,
   SearchIssuesResult
 } from "./types.js";
 import { RedmineClient } from "./redmine/client.js";
 
 const SEARCH_PAGE_SIZE = 10;
 const MAX_SEARCH_SCAN = 100;
+const DEFAULT_RESOLVE_STATUS = "Rozwiązany";
 
 export class RedmineService {
   private readonly policy: ProjectPolicy;
+  private readonly defaultExternalProjects: string[];
 
-  public constructor(private readonly client: RedmineClient, allowedProjects: string[]) {
+  public constructor(
+    private readonly client: RedmineClient,
+    allowedProjects: string[],
+    defaultExternalProjects: string[]
+  ) {
+    if (!defaultExternalProjects || defaultExternalProjects.length === 0) {
+      throw new RedmineMcpError(
+        "VALIDATION_ERROR",
+        "RedmineService requires a non-empty defaultExternalProjects list (set REDMINE_DEFAULT_EXTERNAL_PROJECTS)."
+      );
+    }
     this.policy = new ProjectPolicy(allowedProjects);
+    this.defaultExternalProjects = defaultExternalProjects;
   }
 
   public async listIssues(input: {
@@ -179,11 +194,138 @@ export class RedmineService {
     return normalizeIssueDetail(updated, this.client.getBaseUrl());
   }
 
+  public async resolveRelatedTestChain(input: {
+    test_issue_id: number;
+    note: string;
+    status?: string;
+    external_projects?: string[];
+    dry_run?: boolean;
+  }): Promise<ResolveRelatedTestChainResult> {
+    const note = input.note.trim();
+    if (!note) {
+      throw new RedmineMcpError("VALIDATION_ERROR", "Note must not be empty.");
+    }
+
+    const status = input.status?.trim() || DEFAULT_RESOLVE_STATUS;
+    const externalProjects = normalizeExternalProjects(input.external_projects, this.defaultExternalProjects);
+    const dryRun = input.dry_run ?? true;
+
+    const testIssue = await this.getAuthorizedIssue(input.test_issue_id);
+    const testProject = await this.client.getProject(String(testIssue.project.id));
+    const sameProjectIssue = await this.findSingleRelatedIssue(
+      testIssue,
+      (candidate, candidateProject) =>
+        candidate.id !== testIssue.id &&
+        candidateProject.id === testProject.id &&
+        candidate.tracker?.name.trim().toLowerCase() !== "test",
+      `Expected exactly one non-test related issue in project "${testProject.name}".`
+    );
+    const externalIssue = await this.findSingleRelatedIssue(
+      sameProjectIssue,
+      (candidate, candidateProject) =>
+        candidate.id !== testIssue.id &&
+        candidate.id !== sameProjectIssue.id &&
+        candidateProject.id !== testProject.id &&
+        externalProjects.some((projectRef) => projectMatches(candidateProject, projectRef)),
+      `Expected exactly one related issue in one of external projects: ${externalProjects.join(", ")}.`
+    );
+
+    const chain = [
+      { role: "test" as const, issue: testIssue },
+      { role: "same_project_issue" as const, issue: sameProjectIssue },
+      { role: "external_issue" as const, issue: externalIssue }
+    ];
+
+    if (!dryRun) {
+      const completed: string[] = [];
+      for (const step of chain) {
+        try {
+          await this.resolveIssueWithNote(step.issue, status, note);
+          completed.push(`#${step.issue.id} (${step.role})`);
+        } catch (error) {
+          const partial = completed.length > 0
+            ? ` Already updated before failure: ${completed.join(", ")}. Chain is now in a partially-resolved state and must be reconciled manually.`
+            : "";
+          const reason = error instanceof Error ? error.message : String(error);
+          throw new RedmineMcpError(
+            "UPSTREAM_ERROR",
+            `Failed to update #${step.issue.id} (${step.role}): ${reason}.${partial}`
+          );
+        }
+      }
+    }
+
+    const refreshedChain = dryRun
+      ? chain
+      : await Promise.all(
+          chain.map(async (step) => ({
+            role: step.role,
+            issue: await this.getAuthorizedIssue(step.issue.id)
+          }))
+        );
+
+    return {
+      dry_run: dryRun,
+      note,
+      status,
+      external_projects: externalProjects,
+      steps: refreshedChain.map((step) => ({
+        role: step.role,
+        target_status: status,
+        action: dryRun ? "would_update" : "updated",
+        issue: normalizeIssueSummary(step.issue, this.client.getBaseUrl())
+      }))
+    };
+  }
+
   private async getAuthorizedIssue(issueId: number) {
     const issue = await this.client.getIssue(issueId, ["journals", "relations", "allowed_statuses"]);
     const project = await this.client.getProject(String(issue.project.id));
     this.policy.assertProjectAllowed(project);
     return issue;
+  }
+
+  private async findSingleRelatedIssue(
+    sourceIssue: RedmineIssue,
+    predicate: (candidate: RedmineIssue, candidateProject: ProjectRef) => boolean,
+    errorPrefix: string
+  ): Promise<RedmineIssue> {
+    const relatedIds = getRelatedIssueIds(sourceIssue);
+    const matches: RedmineIssue[] = [];
+
+    for (const relatedId of relatedIds) {
+      const candidate = await this.getAuthorizedIssue(relatedId);
+      const candidateProject = await this.client.getProject(String(candidate.project.id));
+      if (predicate(candidate, candidateProject)) {
+        matches.push(candidate);
+      }
+    }
+
+    if (matches.length === 1) {
+      return matches[0]!;
+    }
+
+    const relatedList = relatedIds.length > 0 ? relatedIds.map((id) => `#${id}`).join(", ") : "none";
+    throw new RedmineMcpError(
+      matches.length === 0 ? "NOT_FOUND" : "VALIDATION_ERROR",
+      `${errorPrefix} Related issue candidates: ${relatedList}.`
+    );
+  }
+
+  private async resolveIssueWithNote(issue: RedmineIssue, status: string, note: string): Promise<void> {
+    const targetStatus = await this.client.getStatus(status, issue.allowed_statuses);
+    await this.client.updateIssue(issue.id, {
+      status_id: targetStatus.id,
+      notes: note
+    });
+
+    const updated = await this.getAuthorizedIssue(issue.id);
+    if (updated.status.id !== targetStatus.id) {
+      throw new RedmineMcpError(
+        "UPSTREAM_ERROR",
+        `Redmine did not persist the requested status change to "${targetStatus.name}" for #${issue.id}.`
+      );
+    }
   }
 
   private async resolveProject(projectRef: string): Promise<ProjectRef> {
@@ -281,4 +423,42 @@ function validateSort(sort?: string): string | undefined {
   }
 
   return sort;
+}
+
+function getRelatedIssueIds(issue: RedmineIssue): number[] {
+  const ids = new Set<number>();
+  for (const relation of issue.relations ?? []) {
+    if (relation.issue_id !== undefined && relation.issue_id !== issue.id) {
+      ids.add(relation.issue_id);
+    }
+    if (relation.issue_to_id !== undefined && relation.issue_to_id !== issue.id) {
+      ids.add(relation.issue_to_id);
+    }
+  }
+
+  return [...ids];
+}
+
+function normalizeExternalProjects(projects: string[] | undefined, fallback: string[]): string[] {
+  const normalized = (projects && projects.length > 0 ? projects : fallback)
+    .map((project) => project.trim())
+    .filter(Boolean);
+
+  if (normalized.length === 0) {
+    throw new RedmineMcpError(
+      "VALIDATION_ERROR",
+      "At least one external project must be provided (set REDMINE_DEFAULT_EXTERNAL_PROJECTS or pass external_projects)."
+    );
+  }
+
+  return [...new Set(normalized)];
+}
+
+function projectMatches(project: ProjectRef, projectRef: string): boolean {
+  const normalized = projectRef.trim().toLowerCase();
+  return (
+    String(project.id).toLowerCase() === normalized ||
+    project.name.toLowerCase() === normalized ||
+    project.identifier?.toLowerCase() === normalized
+  );
 }
