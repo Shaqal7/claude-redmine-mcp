@@ -38,6 +38,8 @@ cp .mcp.json.example .mcp.json  # edit with your Redmine credentials
 npm run build
 ```
 
+> Setting this up on a new machine for the first time? Follow **[INSTALL.md](INSTALL.md)** for the full walkthrough — Node prerequisites, finding your Redmine API key, registering with Claude Code (project- or user-scope), verification, and troubleshooting.
+
 ## Docker
 
 Build the image:
@@ -80,47 +82,40 @@ docker mcp gateway run
 
 ## Claude Code configuration
 
-Copy the example and fill in your credentials:
+There are two ways to register the server — quick project-scope setup for trying it out, or user-scope so the MCP is available from any directory.
+
+**Full step-by-step instructions for a fresh machine (incl. troubleshooting and credential rotation) live in [INSTALL.md](INSTALL.md).** Share that file with teammates onboarding to this MCP.
+
+### Quick start (project-scope)
 
 ```bash
-cp .mcp.json.example .mcp.json
+cp .env.example .env             # edit with your Redmine credentials
+cp .mcp.json.example .mcp.json   # uses ${VAR} interpolation from .env
 ```
 
-Edit `.mcp.json` with hardcoded values:
+Then run `claude` inside the project directory — Claude Code will detect `.mcp.json` and prompt to trust it. The MCP is only visible from this directory.
 
-```json
-{
-  "mcpServers": {
-    "redmine": {
-      "command": "node",
-      "args": ["dist/index.js"],
-      "env": {
-        "REDMINE_BASE_URL": "https://redmine.example.com/redmine",
-        "REDMINE_API_KEY": "your-api-key",
-        "REDMINE_ALLOWED_PROJECTS": "myproject,otherproject",
-        "REDMINE_DEFAULT_EXTERNAL_PROJECTS": "otherproject",
-        "REDMINE_TIMEOUT_MS": "15000"
-      }
-    }
-  }
-}
-```
-
-Alternatively, if you have the environment variables set at system level, `.mcp.json.example` uses `${VAR}` interpolation — Claude Code will expand them at server start.
-
-Both `.env` and `.mcp.json` are gitignored. Only the `.example` templates are tracked.
-
-### Manual registration (alternative)
-
-If you prefer not to use `.mcp.json`, export the environment variables in your shell and run:
+### Recommended (user-scope, works from anywhere)
 
 ```bash
-claude mcp add redmine --scope local -- node dist/index.js
+claude mcp add redmine --scope user \
+  -e REDMINE_BASE_URL=https://redmine.example.com/redmine \
+  -e REDMINE_API_KEY=your-api-key \
+  -e REDMINE_ALLOWED_PROJECTS=myproject,otherproject \
+  -e REDMINE_DEFAULT_EXTERNAL_PROJECTS=otherproject \
+  -e REDMINE_TIMEOUT_MS=15000 \
+  -- node /absolute/path/to/claude-redmine-mcp/dist/index.js
 ```
+
+The absolute path is required — relative paths break when Claude Code spawns the server from a different `cwd`. Credentials end up in `~/.claude.json` (plaintext, per-user, not committed). See [INSTALL.md](INSTALL.md#security-notes) for trade-offs.
+
+Verify with `claude mcp list` — `redmine` should show `✓ Connected`. Inside a session, `/mcp` lists the available tools.
 
 ## Project structure
 
 ```text
+INSTALL.md            # step-by-step setup guide for teammates
+CLAUDE.md             # architecture notes for AI coding assistants
 .env.example          # env template (tracked)
 .mcp.json.example     # MCP config template (tracked)
 .env                  # your credentials (gitignored)
