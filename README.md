@@ -10,6 +10,7 @@ Local MCP server for Claude Code that exposes a narrow, issue-focused Redmine in
 - `add_issue_note` — append a note (requires user confirmation)
 - `update_issue_status` — change issue status with validation
 - `assign_issue` — reassign to a project member
+- `resolve_related_test_chain` — resolve a test issue plus its same-project related issue and one external related issue with the same note (defaults to `dry_run=true`; not atomic — partial failures are surfaced)
 
 The server is intentionally opinionated:
 
@@ -50,6 +51,7 @@ docker run -i --rm \
   -e REDMINE_BASE_URL=https://redmine.example.com/redmine \
   -e REDMINE_API_KEY=your-api-key \
   -e REDMINE_ALLOWED_PROJECTS=project1,project2 \
+  -e REDMINE_DEFAULT_EXTERNAL_PROJECTS=project2 \
   redmine-mcp
 ```
 
@@ -64,12 +66,13 @@ docker mcp gateway run
 
 ## Environment variables
 
-| Variable                   | Required | Description                                                                                                    |
-| -------------------------- | -------- | -------------------------------------------------------------------------------------------------------------- |
-| `REDMINE_BASE_URL`         | yes      | Full base URL of your Redmine instance, including subpath if any (e.g. `https://redmine.example.com/redmine`)  |
-| `REDMINE_API_KEY`          | yes      | API key for the Redmine user running the integration                                                           |
-| `REDMINE_ALLOWED_PROJECTS` | yes      | Comma-separated project **identifiers** (slugs) or numeric IDs                                                 |
-| `REDMINE_TIMEOUT_MS`       | no       | HTTP timeout in milliseconds (default: `15000`)                                                                |
+| Variable                            | Required | Description                                                                                                                                                                          |
+| ----------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `REDMINE_BASE_URL`                  | yes      | Full base URL of your Redmine instance, including subpath if any (e.g. `https://redmine.example.com/redmine`)                                                                        |
+| `REDMINE_API_KEY`                   | yes      | API key for the Redmine user running the integration                                                                                                                                 |
+| `REDMINE_ALLOWED_PROJECTS`          | yes      | Comma-separated project **identifiers** (slugs) or numeric IDs — global allowlist enforced on every read                                                                              |
+| `REDMINE_DEFAULT_EXTERNAL_PROJECTS` | yes      | Comma-separated project identifiers used as defaults for `resolve_related_test_chain` when its `external_projects` arg is omitted. Every entry must also appear in the allowlist     |
+| `REDMINE_TIMEOUT_MS`                | no       | HTTP timeout in milliseconds (default: `15000`)                                                                                                                                      |
 
 **Finding the project identifier:** open the project in Redmine — the identifier is the last segment of the URL. For example, `https://redmine.example.com/redmine/projects/myproject` has identifier `myproject`.
 
@@ -93,6 +96,7 @@ Edit `.mcp.json` with hardcoded values:
         "REDMINE_BASE_URL": "https://redmine.example.com/redmine",
         "REDMINE_API_KEY": "your-api-key",
         "REDMINE_ALLOWED_PROJECTS": "myproject,otherproject",
+        "REDMINE_DEFAULT_EXTERNAL_PROJECTS": "otherproject",
         "REDMINE_TIMEOUT_MS": "15000"
       }
     }
