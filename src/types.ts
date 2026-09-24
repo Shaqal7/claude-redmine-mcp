@@ -51,9 +51,27 @@ export interface RedmineRelation {
   delay?: number | null;
 }
 
+export interface RedmineAttachment {
+  id: number;
+  filename: string;
+  filesize?: number;
+  content_type?: string;
+  description?: string;
+  content_url?: string;
+  author?: NamedRef;
+  created_on?: string;
+}
+
+export interface RedmineChildIssue {
+  id: number;
+  subject: string;
+  tracker?: NamedRef;
+}
+
 export interface RedmineIssue {
   id: number;
   project: NamedRef;
+  parent?: { id: number };
   tracker?: NamedRef;
   status: NamedRef;
   priority?: NamedRef;
@@ -67,6 +85,24 @@ export interface RedmineIssue {
   journals?: RedmineJournal[];
   relations?: RedmineRelation[];
   allowed_statuses?: NamedRef[];
+  attachments?: RedmineAttachment[];
+  children?: RedmineChildIssue[];
+}
+
+export interface RedmineSearchResult {
+  id: number;
+  title: string;
+  type: string;
+  url: string;
+  description?: string;
+  datetime?: string;
+}
+
+export interface RedmineSearchResponse {
+  results: RedmineSearchResult[];
+  total_count: number;
+  offset: number;
+  limit: number;
 }
 
 export interface RedmineIssueListResponse {
@@ -147,6 +183,18 @@ export interface NormalizedIssueDetail extends NormalizedIssueSummary {
     }>;
   }>;
   allowed_statuses: string[];
+  parent_id: number | null;
+  children: Array<{ id: number; subject: string; tracker: string | null }>;
+  attachments: Array<{
+    id: number;
+    filename: string;
+    filesize: number | null;
+    content_type: string | null;
+    description: string | null;
+    author: string | null;
+    created_on: string | null;
+    url: string | null;
+  }>;
 }
 
 export interface ListIssuesResult {
@@ -156,12 +204,29 @@ export interface ListIssuesResult {
   issues: NormalizedIssueSummary[];
 }
 
+export interface SearchIssueHit extends NormalizedIssueSummary {
+  /** Fragment of the matching text as returned by Redmine search (subject, description or a note). */
+  match_excerpt?: string | null;
+}
+
 export interface SearchIssuesResult {
   query: string;
+  /** "fulltext" = Redmine /search.json (whole history, incl. notes); "scan" = legacy fallback over recent issues. */
+  mode: "fulltext" | "scan";
   count: number;
+  /** fulltext: search hits examined; scan: issues examined. */
   scanned_issues: number;
+  /** fulltext only: total hits reported by Redmine across searched projects. */
+  total_hits?: number;
   truncated: boolean;
-  issues: NormalizedIssueSummary[];
+  issues: SearchIssueHit[];
+}
+
+export interface UpdateIssueNoteResult {
+  issue_id: number;
+  journal_id: number;
+  action: "updated" | "deleted";
+  issue: NormalizedIssueDetail;
 }
 
 export interface ResolveRelatedTestChainStep {

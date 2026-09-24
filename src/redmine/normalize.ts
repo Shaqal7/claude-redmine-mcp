@@ -66,6 +66,22 @@ export function normalizeIssueDetail(issue: RedmineIssue, baseUrl: string): Norm
         new_value: detail.new_value ?? null
       }))
     })),
-    allowed_statuses: (issue.allowed_statuses ?? []).map((status) => status.name)
+    allowed_statuses: (issue.allowed_statuses ?? []).map((status) => status.name),
+    parent_id: issue.parent?.id ?? null,
+    children: (issue.children ?? []).map((child) => ({
+      id: child.id,
+      subject: child.subject,
+      tracker: child.tracker?.name ?? null
+    })),
+    attachments: (issue.attachments ?? []).map((attachment) => ({
+      id: attachment.id,
+      filename: attachment.filename,
+      filesize: attachment.filesize ?? null,
+      content_type: attachment.content_type ?? null,
+      description: attachment.description?.trim() || null,
+      author: attachment.author?.name ?? null,
+      created_on: attachment.created_on ?? null,
+      url: attachment.content_url ?? null
+    }))
   };
 }

@@ -5,9 +5,10 @@ Local MCP server for Claude Code that exposes a narrow, issue-focused Redmine in
 ## Features
 
 - `list_issues` — compact issue summaries for one allowed project
-- `search_issues` — full-text search across subjects and descriptions
-- `get_issue` — normalized detail with journals, relations, and custom fields
+- `search_issues` — full-text search via Redmine's own search engine (`/projects/{id}/search.json`) over the whole project history: subjects, descriptions **and journal notes**; returns a `match_excerpt` per hit. Options: `all_words` (default `true`), `titles_only`. Falls back to scanning the 100 most recently updated issues (`mode: "scan"`) only if the search endpoint is unavailable.
+- `get_issue` — normalized detail with journals (incl. journal ids), relations, custom fields, attachments, parent and children
 - `add_issue_note` — append a note (requires user confirmation)
+- `update_issue_note` / `delete_issue_note` — edit or remove an existing note by `journal_id` via `PUT /journals/{id}.json` (Redmine 5.0+, needs edit-notes permission; read-after-write verified)
 - `update_issue_status` — change issue status with validation
 - `assign_issue` — reassign to a project member
 - `resolve_related_test_chain` — resolve a test issue plus its same-project related issue and one external related issue with the same note (defaults to `dry_run=true`; not atomic — partial failures are surfaced)

@@ -98,17 +98,20 @@ redmine: node /absolute/path/to/dist/index.js - ✓ Connected
 
 If you see `✗ Failed to connect`, see [Troubleshooting](#troubleshooting) below.
 
-Inside a Claude Code session, type `/mcp` — `redmine` should appear with all 9 tools:
+Inside a Claude Code session, type `/mcp` — `redmine` should appear with all 12 tools:
 
 - `list_issues`
 - `search_issues`
 - `get_issue`
 - `add_issue_note`
+- `update_issue_note`
+- `delete_issue_note`
 - `update_issue_status`
 - `assign_issue`
 - `resolve_related_test_chain`
 - `attach_file_to_issue`
 - `attach_file_to_test_chain`
+- `resolve_chain_with_attachment`
 
 Quick smoke test in Claude Code:
 

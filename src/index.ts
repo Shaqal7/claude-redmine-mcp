@@ -31,22 +31,45 @@ server.registerTool("list_issues", {
 }, handlers.listIssues);
 
 server.registerTool("search_issues", {
-  description: "Search issue subjects and descriptions across allowed Redmine projects.",
+  description:
+    "Full-text search over the WHOLE history of allowed Redmine projects — subjects, descriptions and journal notes (Redmine's own search engine). By default all words must match (all_words=true); set all_words=false for any-word matching, titles_only=true to match subjects only. Each hit carries match_excerpt. Result mode='scan' means the server fell back to scanning only the 100 most recently updated issues (search disabled on this Redmine).",
   inputSchema: {
     query: z.string().min(1),
     project: z.string().optional(),
     status: z.string().optional(),
     assignee: z.string().optional(),
-    limit: z.number().int().min(1).max(50).optional()
+    limit: z.number().int().min(1).max(50).optional(),
+    titles_only: z.boolean().optional(),
+    all_words: z.boolean().optional()
   }
 }, handlers.searchIssues);
 
 server.registerTool("get_issue", {
-  description: "Fetch normalized detail for one issue, including journals and relations.",
+  description:
+    "Fetch normalized detail for one issue, including journals (with journal ids), relations, attachments, parent and child issues.",
   inputSchema: {
     issue_id: z.number().int().positive()
   }
 }, handlers.getIssue);
+
+server.registerTool("update_issue_note", {
+  description:
+    "Replace the text of an existing note (journal) on a Redmine issue. Get journal_id from get_issue. Requires Redmine 5.0+ and edit-notes permission. Only call this after explicit user confirmation.",
+  inputSchema: {
+    issue_id: z.number().int().positive(),
+    journal_id: z.number().int().positive(),
+    note: z.string().min(1)
+  }
+}, handlers.updateIssueNote);
+
+server.registerTool("delete_issue_note", {
+  description:
+    "Remove the text of an existing note (journal) on a Redmine issue; a journal without field changes disappears entirely. Irreversible. Get journal_id from get_issue. Requires Redmine 5.0+ and edit-notes permission. Only call this after explicit user confirmation.",
+  inputSchema: {
+    issue_id: z.number().int().positive(),
+    journal_id: z.number().int().positive()
+  }
+}, handlers.deleteIssueNote);
 
 server.registerTool("add_issue_note", {
   description: "Add a note to a Redmine issue. Only call this after explicit user confirmation.",

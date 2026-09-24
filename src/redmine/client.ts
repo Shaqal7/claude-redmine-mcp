@@ -10,6 +10,7 @@ import type {
   RedmineMembership,
   RedmineMembershipsResponse,
   RedmineProjectResponse,
+  RedmineSearchResponse,
   RedmineStatusesResponse,
   RedmineUploadResponse
 } from "../types.js";
@@ -73,6 +74,66 @@ export class RedmineClient {
         limit: params.limit,
         offset: params.offset ?? 0,
         sort: params.sort
+      }
+    });
+  }
+
+  /**
+   * Redmine full-text search scoped to one project (subject, description and journal notes, whole history).
+   * Returns only issue hits; project scope keeps the allowlist enforceable.
+   */
+  public async searchProjectIssues(params: {
+    projectRef: string | number;
+    query: string;
+    limit: number;
+    offset?: number;
+    titlesOnly?: boolean;
+    allWords?: boolean;
+    openOnly?: boolean;
+  }): Promise<RedmineSearchResponse> {
+    return this.request<RedmineSearchResponse>(
+      `/projects/${encodeURIComponent(String(params.projectRef))}/search.json`,
+      {
+        query: {
+          q: params.query,
+          issues: 1,
+          limit: params.limit,
+          offset: params.offset ?? 0,
+          titles_only: params.titlesOnly ? 1 : undefined,
+          all_words: params.allWords === false ? "" : 1,
+          open_issues: params.openOnly ? 1 : undefined
+        }
+      }
+    );
+  }
+
+  /** Fetch several issues in one call. Filters (status/assignee) are applied by Redmine. */
+  public async listIssuesByIds(params: {
+    issueIds: number[];
+    statusId?: string | number;
+    assignedToId?: string | number;
+  }): Promise<RedmineIssue[]> {
+    if (params.issueIds.length === 0) {
+      return [];
+    }
+
+    const response = await this.request<RedmineIssueListResponse>("/issues.json", {
+      query: {
+        issue_id: params.issueIds.join(","),
+        status_id: params.statusId === undefined ? "*" : String(params.statusId),
+        assigned_to_id: params.assignedToId === undefined ? undefined : String(params.assignedToId),
+        limit: Math.min(params.issueIds.length, 100)
+      }
+    });
+
+    return response.issues;
+  }
+
+  public async updateJournalNotes(journalId: number, notes: string): Promise<void> {
+    await this.request<void>(`/journals/${journalId}.json`, {
+      method: "PUT",
+      body: {
+        journal: { notes }
       }
     });
   }

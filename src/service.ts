@@ -14,7 +14,9 @@ import type {
   RedmineIssue,
   ResolveChainWithAttachmentResult,
   ResolveRelatedTestChainResult,
-  SearchIssuesResult
+  SearchIssueHit,
+  SearchIssuesResult,
+  UpdateIssueNoteResult
 } from "./types.js";
 import { RedmineClient } from "./redmine/client.js";
 
@@ -22,6 +24,8 @@ type FileReader = (filePath: string) => Promise<Uint8Array>;
 
 const SEARCH_PAGE_SIZE = 10;
 const MAX_SEARCH_SCAN = 100;
+const FULLTEXT_PAGE_SIZE = 100;
+const MAX_FULLTEXT_HITS_PER_PROJECT = 2000;
 const DEFAULT_RESOLVE_STATUS = "Rozwiązany";
 
 export class RedmineService {
@@ -80,6 +84,8 @@ export class RedmineService {
     status?: string;
     assignee?: string;
     limit?: number;
+    titles_only?: boolean;
+    all_words?: boolean;
   }): Promise<SearchIssuesResult> {
     const query = input.query.trim();
     if (!query) {
@@ -92,6 +98,127 @@ export class RedmineService {
     const limit = clampLimit(input.limit);
     const statusId = await this.resolveStatusFilter(input.status);
 
+    try {
+      return await this.fullTextSearch({
+        query,
+        projects,
+        limit,
+        statusId,
+        assignee: input.assignee,
+        titlesOnly: input.titles_only ?? false,
+        allWords: input.all_words ?? true
+      });
+    } catch (error) {
+      // Search module disabled or endpoint unavailable on this Redmine — fall back to the legacy scan.
+      if (error instanceof RedmineMcpError && error.code === "NOT_FOUND") {
+        return this.scanRecentIssues({ query, projects, limit, statusId, assignee: input.assignee });
+      }
+      throw error;
+    }
+  }
+
+  private async fullTextSearch(input: {
+    query: string;
+    projects: ProjectRef[];
+    limit: number;
+    statusId: string | number | undefined;
+    assignee?: string;
+    titlesOnly: boolean;
+    allWords: boolean;
+  }): Promise<SearchIssuesResult> {
+    const results: SearchIssueHit[] = [];
+    const seen = new Set<number>();
+    let scannedHits = 0;
+    let totalHits = 0;
+    let truncated = false;
+
+    for (const project of input.projects) {
+      if (results.length >= input.limit) {
+        truncated = true;
+        break;
+      }
+
+      const assignedToId = await this.resolveAssigneeFilter(project, input.assignee);
+      let offset = 0;
+      let projectHitsScanned = 0;
+
+      while (results.length < input.limit) {
+        const page = await this.client.searchProjectIssues({
+          projectRef: project.identifier ?? project.id,
+          query: input.query,
+          limit: FULLTEXT_PAGE_SIZE,
+          offset,
+          titlesOnly: input.titlesOnly,
+          allWords: input.allWords
+        });
+
+        if (offset === 0) {
+          totalHits += page.total_count;
+        }
+
+        const hits = page.results.filter((hit) => hit.type.startsWith("issue") && !seen.has(hit.id));
+        scannedHits += page.results.length;
+        projectHitsScanned += page.results.length;
+
+        const excerptById = new Map(hits.map((hit) => [hit.id, hit.description?.trim() || null]));
+        const issues = await this.client.listIssuesByIds({
+          issueIds: hits.map((hit) => hit.id),
+          statusId: input.statusId,
+          assignedToId
+        });
+        const issuesById = new Map(issues.map((issue) => [issue.id, issue]));
+
+        // Keep Redmine's relevance/date ordering from the search response.
+        for (const hit of hits) {
+          seen.add(hit.id);
+          const issue = issuesById.get(hit.id);
+          if (!issue || !(await this.isIssueProjectAllowed(issue))) {
+            continue;
+          }
+          if (results.length >= input.limit) {
+            truncated = true;
+            break;
+          }
+          results.push({
+            ...normalizeIssueSummary(issue, this.client.getBaseUrl()),
+            match_excerpt: excerptById.get(hit.id) ?? null
+          });
+        }
+
+        offset += FULLTEXT_PAGE_SIZE;
+        if (page.results.length === 0 || offset >= page.total_count) {
+          break;
+        }
+        if (results.length >= input.limit) {
+          truncated = true;
+          break;
+        }
+        if (projectHitsScanned >= MAX_FULLTEXT_HITS_PER_PROJECT) {
+          truncated = true;
+          break;
+        }
+      }
+    }
+
+    return {
+      query: input.query,
+      mode: "fulltext",
+      count: results.length,
+      scanned_issues: scannedHits,
+      total_hits: totalHits,
+      truncated,
+      issues: results
+    };
+  }
+
+  private async scanRecentIssues(input: {
+    query: string;
+    projects: ProjectRef[];
+    limit: number;
+    statusId: string | number | undefined;
+    assignee?: string;
+  }): Promise<SearchIssuesResult> {
+    const { query, projects, limit, statusId } = input;
     const results: SearchIssuesResult["issues"] = [];
     let scannedIssues = 0;
     let truncated = false;
@@ -121,10 +248,10 @@ export class RedmineService {
           }
 
           scannedIssues += 1;
-          const detailedIssue = await this.client.getIssue(issue.id);
-          const haystack = `${detailedIssue.subject}\n${detailedIssue.description ?? ""}`.toLowerCase();
+          // /issues.json already carries subject + description — no per-issue fetch needed.
+          const haystack = `${issue.subject}\n${issue.description ?? ""}`.toLowerCase();
           if (haystack.includes(loweredQuery)) {
-            results.push(normalizeIssueSummary(detailedIssue, this.client.getBaseUrl()));
+            results.push(normalizeIssueSummary(issue, this.client.getBaseUrl()));
           }
         }
 
@@ -146,6 +273,7 @@ export class RedmineService {
 
     return {
       query,
+      mode: "scan",
       count: results.length,
       scanned_issues: scannedIssues,
       truncated,
@@ -502,11 +630,100 @@ export class RedmineService {
     };
   }
 
+  public async updateIssueNote(input: {
+    issue_id: number;
+    journal_id: number;
+    note: string;
+  }): Promise<UpdateIssueNoteResult> {
+    const note = input.note.trim();
+    if (!note) {
+      throw new RedmineMcpError(
+        "VALIDATION_ERROR",
+        "Note must not be empty. Use delete_issue_note to remove a note."
+      );
+    }
+    return this.writeJournalNotes(input.issue_id, input.journal_id, note, "updated");
+  }
+
+  public async deleteIssueNote(input: { issue_id: number; journal_id: number }): Promise<UpdateIssueNoteResult> {
+    return this.writeJournalNotes(input.issue_id, input.journal_id, "", "deleted");
+  }
+
+  private async writeJournalNotes(
+    issueId: number,
+    journalId: number,
+    notes: string,
+    action: UpdateIssueNoteResult["action"]
+  ): Promise<UpdateIssueNoteResult> {
+    const issue = await this.getAuthorizedIssue(issueId);
+    const journal = (issue.journals ?? []).find((entry) => entry.id === journalId);
+    if (!journal) {
+      throw new RedmineMcpError(
+        "NOT_FOUND",
+        `Journal #${journalId} does not belong to issue #${issueId}.`
+      );
+    }
+    if (!journal.notes?.trim()) {
+      throw new RedmineMcpError(
+        "VALIDATION_ERROR",
+        `Journal #${journalId} has no note text (it only records field changes) and cannot be edited.`
+      );
+    }
+
+    try {
+      await this.client.updateJournalNotes(journalId, notes);
+    } catch (error) {
+      if (error instanceof RedmineMcpError && error.code === "NOT_FOUND") {
+        throw new RedmineMcpError(
+          "UPSTREAM_ERROR",
+          "This Redmine does not expose PUT /journals/{id}.json (requires Redmine 5.0+). Edit the note in the Redmine UI."
+        );
+      }
+      throw error;
+    }
+
+    const updated = await this.getAuthorizedIssue(issueId);
+    const updatedJournal = (updated.journals ?? []).find((entry) => entry.id === journalId);
+    const persisted =
+      action === "deleted"
+        ? !updatedJournal?.notes?.trim()
+        : updatedJournal?.notes?.trim() === notes;
+    if (!persisted) {
+      throw new RedmineMcpError(
+        "UPSTREAM_ERROR",
+        `Redmine did not persist the note ${action === "deleted" ? "deletion" : "change"} for journal #${journalId} (missing edit_own_notes / edit_notes permission?).`
+      );
+    }
+
+    return {
+      issue_id: issueId,
+      journal_id: journalId,
+      action,
+      issue: normalizeIssueDetail(updated, this.client.getBaseUrl())
+    };
+  }
+
   private async getAuthorizedIssue(issueId: number) {
-    const issue = await this.client.getIssue(issueId, ["journals", "relations", "allowed_statuses"]);
+    const issue = await this.client.getIssue(issueId, [
+      "journals",
+      "relations",
+      "allowed_statuses",
+      "attachments",
+      "children"
+    ]);
     const project = await this.client.getProject(String(issue.project.id));
     this.policy.assertProjectAllowed(project);
     return issue;
+  }
+
+  private async isIssueProjectAllowed(issue: RedmineIssue): Promise<boolean> {
+    const project = await this.client.getProject(String(issue.project.id));
+    try {
+      this.policy.assertProjectAllowed(project);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async findSingleRelatedIssue(

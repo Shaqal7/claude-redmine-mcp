@@ -21,7 +21,13 @@ export function createToolHandlers(service: RedmineService) {
       status?: string;
       assignee?: string;
       limit?: number;
+      titles_only?: boolean;
+      all_words?: boolean;
     }): Promise<ToolResponse> => handleTool(async () => service.searchIssues(input)),
+    updateIssueNote: async (input: { issue_id: number; journal_id: number; note: string }): Promise<ToolResponse> =>
+      handleTool(async () => service.updateIssueNote(input)),
+    deleteIssueNote: async (input: { issue_id: number; journal_id: number }): Promise<ToolResponse> =>
+      handleTool(async () => service.deleteIssueNote(input)),
     getIssue: async (input: { issue_id: number }): Promise<ToolResponse> =>
       handleTool(async () => service.getIssue(input.issue_id)),
     addIssueNote: async (input: { issue_id: number; note: string }): Promise<ToolResponse> =>

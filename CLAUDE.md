@@ -36,6 +36,14 @@ Key invariants — preserve these when adding tools or editing the service:
 - **Status and assignee resolution is name-tolerant.** `client.getStatus` and `service.resolveProjectMember` accept ID, name, or `"me"` and do exact + fuzzy matching, throwing `VALIDATION_ERROR` on ambiguity. Don't bypass these helpers.
 - **No generic Redmine bridge.** Each tool exposes a narrow shape. Resist the temptation to add a passthrough — the whole point of this server is to constrain what the model can do.
 
+### `search_issues`
+
+Primary path is Redmine's search engine, called **per allowed project** (`/projects/{identifier}/search.json?issues=1`) so the allowlist stays enforceable — the global `/search.json` would leak other projects. Hits are hydrated in one batch via `/issues.json?issue_id=a,b,c` (which also applies status/assignee filters), and every hit is re-checked with `isIssueProjectAllowed` because project search includes subprojects. Result order follows Redmine's search order. Only a `NOT_FOUND` from the search endpoint triggers the legacy `scanRecentIssues` fallback (`mode: "scan"`, 100 most recent issues, subject+description only).
+
+### `update_issue_note` / `delete_issue_note`
+
+Use `PUT /journals/{id}.json` (Redmine 5.0+). The journal must belong to the given issue (checked against `getAuthorizedIssue` journals, so the allowlist applies) and must carry note text. Delete = blank notes; Redmine removes a journal that has no field changes left. Both re-fetch and verify, since Redmine silently ignores edits without the edit-notes permission.
+
 ### `resolve_related_test_chain`
 
 This is the most complex tool. It traverses `test → same_project_issue → external_issue` via issue relations:
