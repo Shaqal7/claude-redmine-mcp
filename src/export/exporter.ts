@@ -41,7 +41,21 @@ const WINDOW_MARGIN_MS = 10 * 60 * 1000;
 const MAX_LIST_ATTEMPTS = 3;
 const MAX_GET_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 500;
-const SKIPPABLE_CODES = new Set(["NOT_FOUND", "AUTH_ERROR"]);
+
+/**
+ * Pominąć wolno tylko zadanie niewidoczne dla klucza: 404 albo 403 (pojedyncze ukryte/prywatne zadanie).
+ * 401 (unieważniony klucz) i AUTH_ERROR bez znanego statusu to awaria systemowa i przerywają eksport.
+ */
+function isSkippable(error: unknown): error is RedmineMcpError {
+  if (!(error instanceof RedmineMcpError)) {
+    return false;
+  }
+  if (error.code === "NOT_FOUND") {
+    return true;
+  }
+  const status = (error.details as { status?: number } | undefined)?.status;
+  return error.code === "AUTH_ERROR" && status === 403;
+}
 
 /** ISO 8601 bez ułamków sekund (`YYYY-MM-DDTHH:MM:SSZ`), format akceptowany przez filtr Redmine. */
 export function toRedmineDate(d: Date): string {
@@ -195,6 +209,7 @@ export async function exportProjects(opts: ExportOptions): Promise<ExportResult>
     );
 
     const lines: string[] = [];
+    let fetchSkipped = 0;
     for (const [id, listedProjectId] of listed.items) {
       if (listedProjectId !== undefined && listedProjectId !== ref.id) {
         skipped += 1;
@@ -205,8 +220,9 @@ export async function exportProjects(opts: ExportOptions): Promise<ExportResult>
       try {
         issue = await getIssueWithRetry(opts.client, id, sleep);
       } catch (error) {
-        if (error instanceof RedmineMcpError && SKIPPABLE_CODES.has(error.code)) {
+        if (isSkippable(error)) {
           skipped += 1;
+          fetchSkipped += 1;
           opts.log(`${slug}: skip issue ${id}: ${error.code}`);
           continue;
         }
@@ -218,6 +234,13 @@ export async function exportProjects(opts: ExportOptions): Promise<ExportResult>
         continue;
       }
       lines.push(JSON.stringify({ kind: "issue", project: slug, exported_at: startedIso, issue }));
+    }
+
+    if (listed.items.size > 0 && fetchSkipped === listed.items.size) {
+      throw new RedmineMcpError(
+        "UPSTREAM_ERROR",
+        `${slug}: every issue from the listing (${fetchSkipped}) was skipped on getIssue, treating it as a systemic failure.`
+      );
     }
 
     await opts.writeFile(joinPath(opts.outDir, `${slug}.jsonl`), lines.map((l) => `${l}\n`).join(""));

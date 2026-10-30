@@ -313,7 +313,8 @@ export class RedmineClient {
       if (response.status === 401 || response.status === 403) {
         throw new RedmineMcpError(
           "AUTH_ERROR",
-          "Redmine rejected the API key or denied access."
+          "Redmine rejected the API key or denied access.",
+          { status: response.status }
         );
       }
 

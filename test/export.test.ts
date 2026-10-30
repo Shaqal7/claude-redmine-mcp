@@ -262,7 +262,7 @@ describe("exportProjects", () => {
     const base = [issue(1), issue(2), issue(3)];
     const getIssue = vi.fn(async (id: number): Promise<RedmineIssue> => {
       if (id === 2) throw new RedmineMcpError("NOT_FOUND", "gone");
-      if (id === 3) throw new RedmineMcpError("AUTH_ERROR", "denied");
+      if (id === 3) throw new RedmineMcpError("AUTH_ERROR", "denied", { status: 403 });
       return { ...base[0]!, journals: [] };
     });
     const { client } = makeClient(base, { getIssue });
@@ -275,6 +275,51 @@ describe("exportProjects", () => {
     expect(logs.some((l) => l.includes("2") && l.includes("NOT_FOUND"))).toBe(true);
     expect(logs.some((l) => l.includes("3") && l.includes("AUTH_ERROR"))).toBe(true);
     expect(getIssue).toHaveBeenCalledTimes(3);
+  });
+
+  it("N1: HTTP 401 aborts the run and proposes no state", async () => {
+    const base = [issue(1), issue(2), issue(3)];
+    const getIssue = vi.fn(async (id: number): Promise<RedmineIssue> => {
+      if (id === 1) return { ...base[0]!, journals: [] };
+      throw new RedmineMcpError("AUTH_ERROR", "revoked", { status: 401 });
+    });
+    const { client } = makeClient(base, { getIssue });
+    const { opts } = makeOpts(client);
+
+    await expect(exportProjects(opts)).rejects.toMatchObject({ code: "AUTH_ERROR" });
+    expect(getIssue).toHaveBeenCalledTimes(2);
+  });
+
+  it("N1: an AUTH_ERROR without a known 403 status is not skipped", async () => {
+    const getIssue = vi.fn(async (): Promise<RedmineIssue> => {
+      throw new RedmineMcpError("AUTH_ERROR", "unknown");
+    });
+    const { client } = makeClient([issue(1), issue(2)], { getIssue });
+    const { opts } = makeOpts(client);
+    await expect(exportProjects(opts)).rejects.toMatchObject({ code: "AUTH_ERROR" });
+  });
+
+  it("N1: fails when every getIssue of a project was skipped although the listing had issues", async () => {
+    const getIssue = vi.fn(async (): Promise<RedmineIssue> => {
+      throw new RedmineMcpError("NOT_FOUND", "gone");
+    });
+    const { client } = makeClient([issue(1), issue(2)], { getIssue });
+    const { opts, writes } = makeOpts(client);
+
+    await expect(exportProjects(opts)).rejects.toThrow(/every issue|all issues/i);
+    expect(Object.keys(writes)).toHaveLength(0);
+  });
+
+  it("N1: does not fail when only some getIssue calls were skipped", async () => {
+    const base = [issue(1), issue(2)];
+    const getIssue = vi.fn(async (id: number): Promise<RedmineIssue> => {
+      if (id === 2) throw new RedmineMcpError("NOT_FOUND", "gone");
+      return { ...base[0]!, journals: [] };
+    });
+    const { client } = makeClient(base, { getIssue });
+    const { opts } = makeOpts(client);
+    const result = await exportProjects(opts);
+    expect(result.skipped).toBe(1);
   });
 
   it("I1: never writes an issue whose own project differs from the requested one (listed subproject issue)", async () => {
