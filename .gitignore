@@ -6,3 +6,5 @@ dist/
 .claude/settings.local.json
 coverage/
 notes/
+
+.claude/worktrees/

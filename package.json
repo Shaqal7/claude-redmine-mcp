@@ -4,7 +4,8 @@
   "description": "Local MCP server for Claude Code backed by the Redmine REST API.",
   "type": "module",
   "bin": {
-    "redmine-mcp": "./dist/index.js"
+    "redmine-mcp": "./dist/index.js",
+    "redmine-export": "./dist/export.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

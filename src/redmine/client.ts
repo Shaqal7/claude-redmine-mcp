@@ -62,15 +62,33 @@ export class RedmineClient {
     projectId: number;
     statusId?: string | number;
     assignedToId?: string | number;
+    updatedOnFrom?: string;
+    updatedOnTo?: string;
+    createdOnTo?: string;
+    subprojectId?: string;
+    include?: string[];
     limit: number;
     offset?: number;
     sort?: string;
   }): Promise<RedmineIssueListResponse> {
+    let updatedOn: string | undefined;
+    if (params.updatedOnFrom && params.updatedOnTo) {
+      updatedOn = `><${params.updatedOnFrom}|${params.updatedOnTo}`;
+    } else if (params.updatedOnFrom) {
+      updatedOn = `>=${params.updatedOnFrom}`;
+    } else if (params.updatedOnTo) {
+      updatedOn = `<=${params.updatedOnTo}`;
+    }
+
     return this.request<RedmineIssueListResponse>("/issues.json", {
       query: {
         project_id: params.projectId,
         status_id: params.statusId === undefined ? "*" : String(params.statusId),
         assigned_to_id: params.assignedToId === undefined ? undefined : String(params.assignedToId),
+        updated_on: updatedOn,
+        created_on: params.createdOnTo ? `<=${params.createdOnTo}` : undefined,
+        subproject_id: params.subprojectId,
+        include: params.include && params.include.length > 0 ? params.include.join(",") : undefined,
         limit: params.limit,
         offset: params.offset ?? 0,
         sort: params.sort
@@ -295,7 +313,8 @@ export class RedmineClient {
       if (response.status === 401 || response.status === 403) {
         throw new RedmineMcpError(
           "AUTH_ERROR",
-          "Redmine rejected the API key or denied access."
+          "Redmine rejected the API key or denied access.",
+          { status: response.status }
         );
       }
 
