@@ -1,5 +1,5 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import { parseArgs } from "node:util";
 
 import dotenv from "dotenv";
@@ -92,9 +92,21 @@ export async function main(argv: string[]): Promise<void> {
       return;
     }
 
+    if (values.state && values["state-out"] && resolve(values.state) === resolve(values["state-out"])) {
+      log("--state i --state-out muszą wskazywać różne pliki.");
+      process.exitCode = 1;
+      return;
+    }
+
     // .env musi być wczytany PRZED importem config.js (który ładuje "dotenv/config" z bieżącego katalogu).
     if (values.env) {
-      dotenv.config({ path: values.env, quiet: true });
+      // override: wartości z pliku --env wygrywają ze zmiennymi powłoki (allowlista pochodzi z tego pliku).
+      const loaded = dotenv.config({ path: values.env, quiet: true, override: true });
+      if (loaded.error) {
+        log(`Nie można wczytać pliku --env: ${values.env}`);
+        process.exitCode = 1;
+        return;
+      }
     }
     const { loadConfig } = await import("../config.js");
     const { RedmineClient } = await import("../redmine/client.js");

@@ -247,15 +247,103 @@ describe("exportProjects", () => {
     expect(idsOf(writes)).toEqual([1]);
   });
 
-  it("does not retry non-upstream errors", async () => {
+  it("does not retry non-upstream errors and still fails on them", async () => {
     const getIssue = vi.fn(async (): Promise<RedmineIssue> => {
-      throw new RedmineMcpError("AUTH_ERROR", "denied");
+      throw new RedmineMcpError("VALIDATION_ERROR", "bad");
     });
     const { client } = makeClient([issue(1)], { getIssue });
     const { opts } = makeOpts(client);
 
-    await expect(exportProjects(opts)).rejects.toMatchObject({ code: "AUTH_ERROR" });
+    await expect(exportProjects(opts)).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
     expect(getIssue).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips an issue with NOT_FOUND or AUTH_ERROR, logs id and code, and counts it", async () => {
+    const base = [issue(1), issue(2), issue(3)];
+    const getIssue = vi.fn(async (id: number): Promise<RedmineIssue> => {
+      if (id === 2) throw new RedmineMcpError("NOT_FOUND", "gone");
+      if (id === 3) throw new RedmineMcpError("AUTH_ERROR", "denied");
+      return { ...base[0]!, journals: [] };
+    });
+    const { client } = makeClient(base, { getIssue });
+    const { opts, writes, logs } = makeOpts(client);
+
+    const result = await exportProjects(opts);
+
+    expect(idsOf(writes)).toEqual([1]);
+    expect(result.skipped).toBe(2);
+    expect(logs.some((l) => l.includes("2") && l.includes("NOT_FOUND"))).toBe(true);
+    expect(logs.some((l) => l.includes("3") && l.includes("AUTH_ERROR"))).toBe(true);
+    expect(getIssue).toHaveBeenCalledTimes(3);
+  });
+
+  it("I1: never writes an issue whose own project differs from the requested one (listed subproject issue)", async () => {
+    const child: RedmineIssue = { ...issue(2), project: { id: 99, name: "SecretChild" } };
+    const { client } = makeClient([issue(1), child]);
+    const { opts, writes, logs } = makeOpts(client);
+
+    const result = await exportProjects(opts);
+
+    expect(idsOf(writes)).toEqual([1]);
+    expect(client.getIssue).not.toHaveBeenCalledWith(2, expect.anything());
+    expect(result.skipped).toBe(1);
+    expect(logs.some((l) => l.includes("2"))).toBe(true);
+    expect(logs.join(" | ")).not.toContain("SecretChild");
+  });
+
+  it("I1: skips an issue that was moved to another project between listing and getIssue", async () => {
+    const base = [issue(1), issue(2)];
+    const getIssue = vi.fn(async (id: number): Promise<RedmineIssue> => {
+      const found = base.find((i) => i.id === id)!;
+      return id === 2 ? { ...found, project: { id: 99, name: "Elsewhere" }, journals: [] } : { ...found, journals: [] };
+    });
+    const { client } = makeClient(base, { getIssue });
+    const { opts, writes } = makeOpts(client);
+
+    const result = await exportProjects(opts);
+
+    expect(idsOf(writes)).toEqual([1]);
+    expect(result.skipped).toBe(1);
+  });
+
+  it("I1: asks Redmine to exclude subprojects", async () => {
+    const { client, listCalls } = makeClient([issue(1)]);
+    const { opts } = makeOpts(client);
+    await exportProjects(opts);
+    expect(listCalls[0]!.subprojectId).toBe("!*");
+  });
+
+  it("I2: after 3 incomplete listings keeps the previous last_updated_on (or omits the project)", async () => {
+    const issues = Array.from({ length: 5 }, (_, i) => issue(i + 1));
+    const listIssues = vi.fn(async (params: ListParams) => ({
+      issues: issues.slice(0, 4),
+      total_count: 5,
+      limit: params.limit,
+      offset: params.offset ?? 0
+    }));
+    const prev: RedmineState = { projects: { rossmannmerge: { last_updated_on: "2026-10-20T12:00:00Z" } } };
+
+    const a = makeOpts(makeClient(issues, { listIssues }).client, { state: prev });
+    const withPrev = await exportProjects(a.opts);
+    expect(withPrev.written.rossmannmerge).toBe(4);
+    expect(withPrev.nextState.projects.rossmannmerge).toEqual({ last_updated_on: "2026-10-20T12:00:00Z" });
+
+    const b = makeOpts(makeClient(issues, { listIssues }).client);
+    const noPrev = await exportProjects(b.opts);
+    expect(noPrev.nextState.projects.rossmannmerge).toBeUndefined();
+  });
+
+  it("M1: normalizes --since to seconds precision UTC", async () => {
+    const { client, listCalls } = makeClient([issue(1)]);
+    const { opts } = makeOpts(client, { since: "2026-10-01T00:00:00.000+02:00" });
+    await exportProjects(opts);
+    expect(listCalls[0]!.updatedOnFrom).toBe("2026-09-30T22:00:00Z");
+  });
+
+  it("M1: rejects an unparsable --since with VALIDATION_ERROR", async () => {
+    const { client } = makeClient([issue(1)]);
+    const { opts } = makeOpts(client, { since: "yesterday" });
+    await expect(exportProjects(opts)).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
   });
 });
 
@@ -276,6 +364,48 @@ describe("reconcileProjects", () => {
     expect(listCalls[0]!.include).toBeUndefined();
     expect(listCalls[0]!.updatedOnFrom).toBeUndefined();
     expect(client.getIssue).not.toHaveBeenCalled();
-    expect(result).toEqual({ written: { rossmannmerge: 3 } });
+    expect(result).toEqual({ written: { rossmannmerge: 3 }, skipped: 0 });
+  });
+
+  it("I1: leaves ids of other projects out of ids.json", async () => {
+    const child: RedmineIssue = { ...issue(2), project: { id: 99, name: "SecretChild" } };
+    const { client, listCalls } = makeClient([issue(1), child]);
+    const { opts, writes } = makeOpts(client);
+    const { state: _state, ...reconcileOpts } = opts;
+
+    await reconcileProjects(reconcileOpts);
+
+    expect(JSON.parse(writes["/out/rossmannmerge.ids.json"]!).ids).toEqual([1]);
+    expect(listCalls[0]!.subprojectId).toBe("!*");
+  });
+
+  it("I3: bounds the listing by created_on so a delete plus a create cannot hide a live id", async () => {
+    let live = Array.from({ length: 10 }, (_, i) => ({ ...issue(i + 1), created_on: "2026-10-01T00:00:00Z" }));
+    let pagesServed = 0;
+    const { client } = makeClient([], {
+      listIssues: vi.fn(async (params: ListParams) => {
+        const offset = params.offset ?? 0;
+        let view = live;
+        if (params.createdOnTo) {
+          view = view.filter((i) => (i.created_on ?? "") <= params.createdOnTo!);
+        }
+        const out = { issues: view.slice(offset, offset + params.limit), total_count: view.length, limit: params.limit, offset };
+        pagesServed += 1;
+        if (pagesServed === 1) {
+          // po pierwszej stronie: id 1 usunięte, id 11 utworzone (po starcie reconcile)
+          live = [...live.filter((i) => i.id !== 1), { ...issue(11), created_on: "2026-10-29T10:00:01Z" }];
+        }
+        return out;
+      })
+    });
+    const { opts, writes } = makeOpts(client, { pageSize: 5 });
+    const { state: _state, ...reconcileOpts } = opts;
+
+    await reconcileProjects(reconcileOpts);
+
+    const ids = JSON.parse(writes["/out/rossmannmerge.ids.json"]!).ids as number[];
+    expect(ids).toContain(6);
+    expect(ids).not.toContain(11);
+    expect(ids).toEqual(expect.arrayContaining([2, 3, 4, 5, 6, 7, 8, 9, 10]));
   });
 });

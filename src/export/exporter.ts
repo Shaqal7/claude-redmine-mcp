@@ -19,6 +19,13 @@ type CommonOptions = {
   writeFile: (path: string, content: string) => Promise<void>;
 };
 
+export type ExportResult = {
+  written: Record<string, number>;
+  /** Liczba pominiętych zadań (inny projekt, NOT_FOUND, AUTH_ERROR); w logu tylko ID i kod. */
+  skipped: number;
+  nextState: RedmineState;
+};
+
 export type ExportOptions = CommonOptions & {
   state: RedmineState;
   ignoreState?: boolean;
@@ -34,6 +41,7 @@ const WINDOW_MARGIN_MS = 10 * 60 * 1000;
 const MAX_LIST_ATTEMPTS = 3;
 const MAX_GET_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 500;
+const SKIPPABLE_CODES = new Set(["NOT_FOUND", "AUTH_ERROR"]);
 
 /** ISO 8601 bez ułamków sekund (`YYYY-MM-DDTHH:MM:SSZ`), format akceptowany przez filtr Redmine. */
 export function toRedmineDate(d: Date): string {
@@ -57,12 +65,16 @@ async function resolveProjects(opts: CommonOptions): Promise<ResolvedProject[]> 
   return resolved;
 }
 
-type ListWindow = { updatedOnFrom?: string; updatedOnTo?: string; include?: string[] };
+type ListWindow = { updatedOnFrom?: string; updatedOnTo?: string; createdOnTo?: string; include?: string[] };
+
+/** id zadania -> id jego własnego projektu (z listy). */
+type ListedIds = { items: Map<number, number | undefined>; complete: boolean };
 
 /**
- * Listuje wszystkie ID zadań projektu. Paginacja po offsecie przesuwa się, gdy zadanie
- * wypada z okna między stronami, więc liczba unikalnych ID musi zgadzać się z total_count
- * z pierwszej strony; inaczej listowanie jest powtarzane (maks. 3 razy).
+ * Listuje wszystkie ID zadań projektu (bez podprojektów). Paginacja po offsecie przesuwa się, gdy
+ * zadanie wypada z okna między stronami, więc liczba unikalnych ID musi zgadzać się z total_count
+ * z pierwszej strony; inaczej listowanie jest powtarzane (maks. 3 razy). `complete: false` oznacza,
+ * że po wszystkich próbach luka nadal może istnieć.
  */
 async function listAllIds(
   opts: CommonOptions,
@@ -70,14 +82,14 @@ async function listAllIds(
   slug: string,
   window: ListWindow,
   sort: string
-): Promise<number[]> {
+): Promise<ListedIds> {
   const pageSize = opts.pageSize ?? DEFAULT_PAGE_SIZE;
-  const union = new Set<number>();
-  let last = new Set<number>();
+  const union = new Map<number, number | undefined>();
+  let lastUnique = 0;
   let expected = 0;
 
   for (let attempt = 1; attempt <= MAX_LIST_ATTEMPTS; attempt += 1) {
-    const ids = new Set<number>();
+    const ids = new Map<number, number | undefined>();
     let offset = 0;
     let total = 0;
     for (;;) {
@@ -85,6 +97,7 @@ async function listAllIds(
         projectId,
         statusId: "*",
         ...window,
+        subprojectId: "!*",
         sort,
         limit: pageSize,
         offset
@@ -93,8 +106,8 @@ async function listAllIds(
         total = page.total_count;
       }
       for (const item of page.issues) {
-        ids.add(item.id);
-        union.add(item.id);
+        ids.set(item.id, item.project?.id);
+        union.set(item.id, item.project?.id);
       }
       offset += pageSize;
       if (offset >= total || page.issues.length === 0) {
@@ -102,18 +115,21 @@ async function listAllIds(
       }
     }
 
-    last = ids;
+    lastUnique = ids.size;
     expected = total;
     if (ids.size === total) {
-      return [...ids];
+      return { items: ids, complete: true };
     }
     if (attempt < MAX_LIST_ATTEMPTS) {
       opts.log(`${slug}: ${ids.size} unique ids vs total_count ${total}, relist (attempt ${attempt + 1}/${MAX_LIST_ATTEMPTS})`);
     }
   }
 
-  opts.log(`warning: ${slug}: ${last.size} unique ids vs total_count ${expected} after ${MAX_LIST_ATTEMPTS} attempts, exporting ${union.size} ids`);
-  return [...union];
+  opts.log(
+    `warning: ${slug}: ${lastUnique} unique ids vs total_count ${expected} after ${MAX_LIST_ATTEMPTS} attempts, ` +
+      `exporting ${union.size} ids, state not advanced`
+  );
+  return { items: union, complete: false };
 }
 
 async function getIssueWithRetry(
@@ -136,7 +152,11 @@ async function getIssueWithRetry(
 
 function windowStart(opts: ExportOptions, slug: string): string | undefined {
   if (opts.since) {
-    return opts.since;
+    const parsedSince = new Date(opts.since);
+    if (Number.isNaN(parsedSince.getTime())) {
+      throw new RedmineMcpError("VALIDATION_ERROR", "Invalid since value, expected an ISO 8601 date.");
+    }
+    return toRedmineDate(parsedSince);
   }
   if (opts.ignoreState) {
     return undefined;
@@ -152,19 +172,17 @@ function windowStart(opts: ExportOptions, slug: string): string | undefined {
   return toRedmineDate(new Date(parsed.getTime() - WINDOW_MARGIN_MS));
 }
 
-export async function exportProjects(
-  opts: ExportOptions
-): Promise<{ written: Record<string, number>; nextState: RedmineState }> {
-  const startedAt = opts.now();
-  const startedIso = toRedmineDate(startedAt);
+export async function exportProjects(opts: ExportOptions): Promise<ExportResult> {
+  const startedIso = toRedmineDate(opts.now());
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const resolved = await resolveProjects(opts);
 
   const written: Record<string, number> = {};
   const nextState: RedmineState = { projects: structuredClone(opts.state.projects) };
+  let skipped = 0;
 
   for (const { slug, ref } of resolved) {
-    const ids = await listAllIds(
+    const listed = await listAllIds(
       opts,
       ref.id,
       slug,
@@ -177,32 +195,76 @@ export async function exportProjects(
     );
 
     const lines: string[] = [];
-    for (const id of ids) {
-      const issue = await getIssueWithRetry(opts.client, id, sleep);
+    for (const [id, listedProjectId] of listed.items) {
+      if (listedProjectId !== undefined && listedProjectId !== ref.id) {
+        skipped += 1;
+        opts.log(`${slug}: skip issue ${id}: belongs to another project`);
+        continue;
+      }
+      let issue: RedmineIssue;
+      try {
+        issue = await getIssueWithRetry(opts.client, id, sleep);
+      } catch (error) {
+        if (error instanceof RedmineMcpError && SKIPPABLE_CODES.has(error.code)) {
+          skipped += 1;
+          opts.log(`${slug}: skip issue ${id}: ${error.code}`);
+          continue;
+        }
+        throw error;
+      }
+      if (issue.project?.id !== ref.id) {
+        skipped += 1;
+        opts.log(`${slug}: skip issue ${id}: belongs to another project`);
+        continue;
+      }
       lines.push(JSON.stringify({ kind: "issue", project: slug, exported_at: startedIso, issue }));
     }
 
     await opts.writeFile(joinPath(opts.outDir, `${slug}.jsonl`), lines.map((l) => `${l}\n`).join(""));
     written[slug] = lines.length;
-    nextState.projects[slug] = { last_updated_on: startedIso };
+    // Przy niekompletnym listowaniu stan zostaje poprzedni (albo projekt bez wpisu), żeby następny
+    // przebieg objął to samo okno; inaczej luka byłaby trwała.
+    if (listed.complete) {
+      nextState.projects[slug] = { last_updated_on: startedIso };
+    }
     opts.log(`${slug}: exported ${lines.length} issues`);
   }
 
-  return { written, nextState: { projects: nextState.projects } };
+  if (skipped > 0) {
+    opts.log(`skipped ${skipped} issues in total`);
+  }
+  return { written, skipped, nextState };
 }
 
-export async function reconcileProjects(opts: ReconcileOptions): Promise<{ written: Record<string, number> }> {
+export async function reconcileProjects(
+  opts: ReconcileOptions
+): Promise<{ written: Record<string, number>; skipped: number }> {
   const startedIso = toRedmineDate(opts.now());
   const resolved = await resolveProjects(opts);
   const written: Record<string, number> = {};
+  let skipped = 0;
 
   for (const { slug, ref } of resolved) {
-    const ids = (await listAllIds(opts, ref.id, slug, {}, "id:asc")).sort((a, b) => a - b);
+    // Górna granica created_on: po starcie nowe zadania nie wchodzą do listy, więc przesunięcie offsetu
+    // może wynikać tylko z odejść, a test zgodności liczby z total_count znów coś znaczy.
+    const listed = await listAllIds(opts, ref.id, slug, { createdOnTo: startedIso }, "id:asc");
+    const ids: number[] = [];
+    for (const [id, projectId] of listed.items) {
+      if (projectId !== undefined && projectId !== ref.id) {
+        skipped += 1;
+        continue;
+      }
+      ids.push(id);
+    }
+    ids.sort((a, b) => a - b);
     const body = JSON.stringify({ project: slug, exported_at: startedIso, ids });
     await opts.writeFile(joinPath(opts.outDir, `${slug}.ids.json`), `${body}\n`);
     written[slug] = ids.length;
     opts.log(`${slug}: reconciled ${ids.length} ids`);
   }
 
-  return { written };
+  if (skipped > 0) {
+    opts.log(`skipped ${skipped} ids of other projects`);
+  }
+  return { written, skipped };
 }

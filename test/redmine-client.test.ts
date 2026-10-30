@@ -77,6 +77,22 @@ describe("RedmineClient", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  it("passes subproject_id, created_on upper bound and open-start updated_on", async () => {
+    const urls: URL[] = [];
+    const fetchMock = vi.fn(async (input: URL | RequestInfo) => {
+      urls.push(new URL(String(input)));
+      return new Response(JSON.stringify({ issues: [], total_count: 0, limit: 100, offset: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    });
+    const client = new RedmineClient(config, fetchMock as typeof fetch);
+    await client.listIssues({ projectId: 1, limit: 100, subprojectId: "!*", createdOnTo: "2026-10-29T10:00:00Z", updatedOnTo: "2026-10-29T10:00:00Z" });
+    expect(urls[0]!.searchParams.get("subproject_id")).toBe("!*");
+    expect(urls[0]!.searchParams.get("created_on")).toBe("<=2026-10-29T10:00:00Z");
+    expect(urls[0]!.searchParams.get("updated_on")).toBe("<=2026-10-29T10:00:00Z");
+  });
+
   it("builds project-scoped search URLs with Redmine's all_words semantics", async () => {
     const urls: URL[] = [];
     const fetchMock = vi.fn(async (input: URL | RequestInfo) => {
