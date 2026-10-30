@@ -39,6 +39,7 @@ export interface RedmineJournal {
   id: number;
   user?: NamedRef;
   notes?: string;
+  private_notes?: boolean;
   created_on: string;
   details?: RedmineJournalDetail[];
 }
@@ -81,6 +82,7 @@ export interface RedmineIssue {
   description?: string;
   created_on?: string;
   updated_on: string;
+  is_private?: boolean;
   custom_fields?: RedmineCustomField[];
   journals?: RedmineJournal[];
   relations?: RedmineRelation[];

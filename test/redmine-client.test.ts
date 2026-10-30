@@ -39,6 +39,44 @@ describe("RedmineClient", () => {
     });
   });
 
+  it("passes updated_on window and include", async () => {
+    const fetchMock = vi.fn(async (input: URL | RequestInfo) => {
+      const url = new URL(String(input));
+      expect(url.searchParams.get("updated_on")).toBe("><2026-10-01T00:00:00Z|2026-10-29T10:00:00Z");
+      expect(url.searchParams.get("include")).toBe("relations,attachments");
+      expect(url.searchParams.get("sort")).toBe("updated_on:asc");
+      return new Response(JSON.stringify({ issues: [], total_count: 0, limit: 100, offset: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    });
+    const client = new RedmineClient(config, fetchMock as typeof fetch);
+    await client.listIssues({
+      projectId: 1,
+      limit: 100,
+      updatedOnFrom: "2026-10-01T00:00:00Z",
+      updatedOnTo: "2026-10-29T10:00:00Z",
+      include: ["relations", "attachments"],
+      sort: "updated_on:asc"
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("passes open-ended updated_on when only from is given and omits empty include", async () => {
+    const fetchMock = vi.fn(async (input: URL | RequestInfo) => {
+      const url = new URL(String(input));
+      expect(url.searchParams.get("updated_on")).toBe(">=2026-10-01T00:00:00Z");
+      expect(url.searchParams.has("include")).toBe(false);
+      return new Response(JSON.stringify({ issues: [], total_count: 0, limit: 100, offset: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    });
+    const client = new RedmineClient(config, fetchMock as typeof fetch);
+    await client.listIssues({ projectId: 1, limit: 100, updatedOnFrom: "2026-10-01T00:00:00Z", include: [] });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it("builds project-scoped search URLs with Redmine's all_words semantics", async () => {
     const urls: URL[] = [];
     const fetchMock = vi.fn(async (input: URL | RequestInfo) => {

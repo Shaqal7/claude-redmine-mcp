@@ -62,15 +62,27 @@ export class RedmineClient {
     projectId: number;
     statusId?: string | number;
     assignedToId?: string | number;
+    updatedOnFrom?: string;
+    updatedOnTo?: string;
+    include?: string[];
     limit: number;
     offset?: number;
     sort?: string;
   }): Promise<RedmineIssueListResponse> {
+    let updatedOn: string | undefined;
+    if (params.updatedOnFrom && params.updatedOnTo) {
+      updatedOn = `><${params.updatedOnFrom}|${params.updatedOnTo}`;
+    } else if (params.updatedOnFrom) {
+      updatedOn = `>=${params.updatedOnFrom}`;
+    }
+
     return this.request<RedmineIssueListResponse>("/issues.json", {
       query: {
         project_id: params.projectId,
         status_id: params.statusId === undefined ? "*" : String(params.statusId),
         assigned_to_id: params.assignedToId === undefined ? undefined : String(params.assignedToId),
+        updated_on: updatedOn,
+        include: params.include && params.include.length > 0 ? params.include.join(",") : undefined,
         limit: params.limit,
         offset: params.offset ?? 0,
         sort: params.sort
