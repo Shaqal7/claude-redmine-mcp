@@ -113,6 +113,32 @@ The absolute path is required — relative paths break when Claude Code spawns t
 
 Verify with `claude mcp list` — `redmine` should show `✓ Connected`. Inside a session, `/mcp` lists the available tools.
 
+## Eksport do bazy wiedzy kb
+
+`redmine-export` (`dist/export.js`, po `npm run build`) zapisuje zadania projektów jako JSONL dla indeksera `kb`. Jest tylko do odczytu: nie zmienia niczego w Redmine.
+
+```bash
+node dist/export.js --projects a,b --out <katalog> --state <plik> --state-out <plik.next>   --env <ścieżka do .env> [--since <ISO>] [--ignore-state] [--reconcile] [--page-size 100]
+```
+
+- `--projects`: identyfikatory projektów; każdy musi być na allowliście `REDMINE_ALLOWED_PROJECTS` (inaczej kod wyjścia 2, `POLICY_ERROR`, nic nie jest zapisane).
+- `--env`: plik `.env` z `REDMINE_*` (wczytywany przed konfiguracją). Wartości z `.env` nie trafiają do logów; na stderr idą tylko liczby i nazwy projektów.
+- Kody wyjścia: 0 sukces, 1 błąd, 2 `POLICY_ERROR`.
+
+**Kontrakt JSONL** (`<out>/<slug>.jsonl`, UTF-8, jedna linia na zadanie):
+
+```json
+{"kind":"issue","project":"rossmannmerge","exported_at":"2026-10-29T10:00:00Z","issue":{ "...surowy obiekt zadania z include=journals,relations,attachments..." }}
+```
+
+Obiekt `issue` jest surowy, bez normalizacji; jeśli serwer zwraca flagi prywatności, są w nim `is_private` oraz `journals[].private_notes`.
+
+**Stan przyrostowy (`--state` / `--state-out`).** Plik stanu ma postać `{"projects":{"<slug>":{"last_updated_on":"2026-10-28T09:25:57Z"}}}`. Eksporter czyta `--state` (brak pliku = pusty stan = pełny eksport) i pobiera zadania z `updated_on` w oknie od `last_updated_on` minus 10 minut do startu eksportu (daty bez ułamków sekund, sortowanie `updated_on:asc`, deduplikacja po ID; nakładka 10 minut daje duplikaty, które są nieszkodliwe). Stanu w `--state` **nie zmienia**: proponowany nowy stan (`last_updated_on` = czas startu eksportu) zapisuje do `--state-out`, a zatwierdza go `kb` po udanym indeksowaniu (rename `*.next` na plik stanu). `--since` zastępuje początek okna, `--ignore-state` pomija okno (pełny eksport).
+
+Gdy liczba unikalnych ID różni się od `total_count` (zadanie wypadło z okna w trakcie paginacji), listowanie jest powtarzane do 3 razy, potem idzie ostrzeżenie w logu i eksport trwa z tym, co zebrano. `getIssue` jest ponawiane do 3 razy przy `UPSTREAM_ERROR`.
+
+**Reconcile (`--reconcile`).** Zapisuje `<out>/<slug>.ids.json` (`{"project":"…","exported_at":"…","ids":[…]}`, ID rosnąco, wszystkie statusy), żeby `kb` mógł usunąć z indeksu zadania, które zniknęły z Redmine. Nie czyta stanu i nie zapisuje `--state-out`.
+
 ## Project structure
 
 ```text
