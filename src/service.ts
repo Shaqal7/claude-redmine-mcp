@@ -657,6 +657,7 @@ export class RedmineService {
     custom_fields?: Record<string, string | string[]>;
     related_issue_id?: number;
     relation_type?: string;
+    attachments?: string[];
     dry_run?: boolean;
   }): Promise<CreateIssueResult> {
     const subject = input.subject.trim();
@@ -671,6 +672,7 @@ export class RedmineService {
     }
     const relationType = normalizeRelationType(input.related_issue_id, input.relation_type);
     const dryRun = input.dry_run ?? true;
+    const attachments = await this.readNewIssueAttachments(input.attachments ?? []);
 
     const project = await this.resolveProject(input.project);
     const relatedIssue =
@@ -704,6 +706,12 @@ export class RedmineService {
       subject,
       description: input.description,
       custom_fields: customFields,
+      attachments: attachments.map((attachment) => ({
+        filename: attachment.filename,
+        content_type: attachment.contentType,
+        size: attachment.bytes.byteLength,
+        embed: inlineImageEmbed(attachment.filename)
+      })),
       required_custom_fields: requiredCustomFields,
       notes,
       relation: relatedIssue && relationType
@@ -730,6 +738,24 @@ export class RedmineService {
     }
     if (customFields.length > 0) {
       payload.custom_fields = customFields.map((field) => ({ id: field.id, value: field.value }));
+    }
+    // Uploading before the create keeps a failed upload from leaving an issue behind, and sending the tokens
+    // with the create lets the description embed the images and puts everything in one journal.
+    if (attachments.length > 0) {
+      const uploads: Array<{ token: string; filename: string; content_type: string }> = [];
+      for (const attachment of attachments) {
+        try {
+          const token = await this.client.uploadAttachment(attachment.filename, attachment.bytes);
+          uploads.push({ token, filename: attachment.filename, content_type: attachment.contentType });
+        } catch (error) {
+          throw new RedmineMcpError(
+            error instanceof RedmineMcpError ? error.code : "UPSTREAM_ERROR",
+            `Uploading attachment "${attachment.filename}" failed: ${reasonOf(error)}. No issue was created.`,
+            error instanceof RedmineMcpError ? error.details : undefined
+          );
+        }
+      }
+      payload.uploads = uploads;
     }
 
     let created: RedmineIssue;
@@ -768,7 +794,8 @@ export class RedmineService {
       tracker,
       priority,
       subject,
-      customFields
+      customFields,
+      attachments: attachments.map((attachment) => attachment.filename)
     });
     if (identity.length > 0) {
       const skipped = relatedIssue ? " The relation step was skipped." : "";
@@ -811,6 +838,29 @@ export class RedmineService {
       url: createdRef.url,
       issue: normalizeIssueSummary(persisted, baseUrl)
     };
+  }
+
+  /** Reads every file before anything is written, so a missing or empty file creates nothing. */
+  private async readNewIssueAttachments(filePaths: string[]) {
+    const attachments: Array<Awaited<ReturnType<RedmineService["readAttachment"]>>> = [];
+    for (const rawPath of filePaths) {
+      const filePath = rawPath.trim();
+      if (!filePath) {
+        throw new RedmineMcpError("VALIDATION_ERROR", "Attachment paths must not be blank.");
+      }
+      const attachment = await this.readAttachment(filePath);
+      const filename = redmineStoredFilename(attachment.filename);
+      // Redmine matches an embedded !image! case-insensitively, and the verification goes by name.
+      const twin = attachments.find((existing) => existing.filename.toLowerCase() === filename.toLowerCase());
+      if (twin) {
+        throw new RedmineMcpError(
+          "VALIDATION_ERROR",
+          `Attachments "${twin.filename}" and "${filename}" share a file name (letter case aside); rename one of them.`
+        );
+      }
+      attachments.push({ ...attachment, filename });
+    }
+    return attachments;
   }
 
   private async resolveNewIssueTracker(
@@ -1216,6 +1266,29 @@ function contentTypeForExtension(extension: string): string {
   return CONTENT_TYPE_BY_EXTENSION[extension.toLowerCase()] ?? "application/octet-stream";
 }
 
+/** Redmine's Attachment#sanitize_filename: the name it stores, and the one a description has to embed. */
+export function redmineStoredFilename(filename: string): string {
+  return filename.replace(/^.*[\\/]/s, "").replace(/[/?%*:|"'<>\n\r]+/g, "_");
+}
+
+const INLINE_IMAGE_EXTENSION = /\.(bmp|gif|jpg|jpe|jpeg|png|webp)$/i;
+
+/**
+ * Textile that shows the image in a description, or null when Redmine does not inline that type.
+ * Redmine CGI-unescapes the src (a "+" would become a space) and Textile ends the src at "(", "!" or a space,
+ * so everything but [A-Za-z0-9-_.~] is percent-encoded.
+ */
+function inlineImageEmbed(filename: string): string | null {
+  if (!INLINE_IMAGE_EXTENSION.test(filename)) {
+    return null;
+  }
+  const encoded = encodeURIComponent(filename).replace(
+    /[!'()*]/g,
+    (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`
+  );
+  return `!${encoded}!`;
+}
+
 function normalizeRelationType(relatedIssueId: number | undefined, relationType: string | undefined): string | undefined {
   if (relatedIssueId === undefined) {
     if (relationType?.trim()) {
@@ -1310,6 +1383,7 @@ function describePersistenceProblems(
     priority: CreateIssueResult["priority"];
     subject: string;
     customFields: CreateIssueCustomField[];
+    attachments: string[];
   }
 ): { identity: string[]; details: string[] } {
   const identity: string[] = [];
@@ -1333,6 +1407,12 @@ function describePersistenceProblems(
     if (!sameCustomFieldValue(actual?.value ?? null, field.value)) {
       const shown = actual ? JSON.stringify(actual.value) : "missing (not enabled for this tracker?)";
       details.push(`custom field "${field.name}" is ${shown} instead of ${JSON.stringify(field.value)}`);
+    }
+  }
+  const storedFilenames = new Set((issue.attachments ?? []).map((attachment) => attachment.filename));
+  for (const filename of expected.attachments) {
+    if (!storedFilenames.has(filename)) {
+      details.push(`attachment "${filename}" is missing (add it with attach_file_to_issue)`);
     }
   }
   return { identity, details };

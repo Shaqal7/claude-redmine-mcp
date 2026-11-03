@@ -72,6 +72,7 @@ export function createToolHandlers(service: RedmineService) {
       custom_fields?: Record<string, string | string[]>;
       related_issue_id?: number;
       relation_type?: string;
+      attachments?: string[];
       dry_run?: boolean;
     }): Promise<ToolResponse> => handleTool(async () => service.createIssue(input))
   };

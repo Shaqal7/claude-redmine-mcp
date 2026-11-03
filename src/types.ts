@@ -342,6 +342,8 @@ export interface CreateIssueResult {
   subject: string;
   description: string;
   custom_fields: CreateIssueCustomField[];
+  /** Named as Redmine stores them; embed is the Textile that shows an image in the description, null otherwise. */
+  attachments: Array<AttachmentDescriptor & { embed: string | null }>;
   required_custom_fields: {
     /** false when the field definitions are not readable with this API key (admin-only endpoint). */
     known: boolean;
