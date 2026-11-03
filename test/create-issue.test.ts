@@ -18,6 +18,7 @@ const createdFixture = fixture<{ issue: RedmineIssue }>("created-issue.json").is
 const adminCustomFields = fixture<{ custom_fields: unknown[] }>("custom-fields-admin.json").custom_fields;
 
 const rossmannProject: ProjectRef = { id: 192, name: "Market3 Merge Rossmann", identifier: "rossmannmerge" };
+const poligonProject: ProjectRef = { id: 2, name: "Rossmann Systemy Centralne | Zgłoszenia", identifier: "poligon" };
 const blockedProject: ProjectRef = { id: 9, name: "Rossmann - Kasa", identifier: "kasa" };
 const BASE_URL = "https://redmine.example.com";
 
@@ -30,6 +31,13 @@ const testIssue: RedmineIssue = {
   updated_on: "2026-11-03T13:15:20Z",
   relations: []
 };
+const poligonIssue: RedmineIssue = {
+  id: 268038,
+  project: { id: 2, name: "Rossmann Systemy Centralne | Zgłoszenia" },
+  status: { id: 1, name: "Nowy" },
+  subject: "[M3] Zgłoszenie klienta",
+  updated_on: "2026-11-03T13:15:20Z"
+};
 const blockedIssue: RedmineIssue = {
   id: 500000,
   project: { id: 9, name: "Rossmann - Kasa" },
@@ -41,17 +49,21 @@ const blockedIssue: RedmineIssue = {
 const SUBJECT = "[MKT, Gotówkomat] Komunikat okna wpłat gubi pełne doby";
 const DESCRIPTION = "h3. Opis\n\nKomunikat podaje czas bez dób.";
 
-function makeClient(options: { created?: RedmineIssue; refetched?: RedmineIssue[]; adminFields?: boolean } = {}) {
+function makeClient(
+  options: { created?: RedmineIssue; refetched?: Array<RedmineIssue | Error>; adminFields?: boolean } = {}
+) {
   const created = options.created ?? createdFixture;
   const refetched = [...(options.refetched ?? [])];
   const issues = new Map<number, RedmineIssue>([
     [testIssue.id, testIssue],
+    [poligonIssue.id, poligonIssue],
     [blockedIssue.id, blockedIssue]
   ]);
   return {
     getBaseUrl: () => BASE_URL,
     getProject: vi.fn(async (ref: string) => {
       if (ref === "192" || ref === "rossmannmerge") return rossmannProject;
+      if (ref === "2" || ref === "poligon") return poligonProject;
       if (ref === "9" || ref === "kasa") return blockedProject;
       throw new RedmineMcpError("NOT_FOUND", "The requested Redmine resource was not found.");
     }),
@@ -69,7 +81,9 @@ function makeClient(options: { created?: RedmineIssue; refetched?: RedmineIssue[
     }),
     getIssue: vi.fn(async (issueId: number) => {
       if (issueId === created.id) {
-        return refetched.length > 0 ? refetched.shift()! : created;
+        const next = refetched.length > 0 ? refetched.shift()! : created;
+        if (next instanceof Error) throw next;
+        return next;
       }
       const found = issues.get(issueId);
       if (!found) throw new RedmineMcpError("NOT_FOUND", "The requested Redmine resource was not found.");
@@ -128,19 +142,102 @@ describe("create_issue", () => {
     expect(client.createIssueRelation).not.toHaveBeenCalled();
   });
 
-  it("falls back to the project's first tracker and Redmine's default priority", async () => {
+  it("leaves the tracker to Redmine when none is given and uses Redmine's default priority", async () => {
+    const client = makeClient({ created: { ...createdFixture, priority: { id: 4, name: "Normalny" } } });
+    const input = { project: "rossmannmerge", subject: SUBJECT, description: DESCRIPTION };
+
+    const preview = await service(client).createIssue(input);
+
+    // Redmine's default is the first tracker the user's role may add, which the API does not expose.
+    expect(preview.tracker).toBeNull();
+    expect(preview.notes.join(" ")).toMatch(/role/);
+    expect(preview.priority).toEqual({ id: 4, name: "Normalny", source: "redmine_default" });
+    expect(preview.relation).toBeNull();
+    expect(preview.custom_fields).toEqual([]);
+
+    const created = await service(client).createIssue({ ...input, dry_run: false });
+
+    expect(client.createIssue).toHaveBeenCalledWith({
+      project_id: 192,
+      priority_id: 4,
+      subject: SUBJECT,
+      description: DESCRIPTION
+    });
+    expect(created.tracker).toEqual({ id: 1, name: "Błąd", source: "redmine_default" });
+  });
+
+  it("rejects a blank tracker or priority instead of falling back to defaults", async () => {
+    const client = makeClient();
+    const base = { project: "rossmannmerge", subject: SUBJECT, description: DESCRIPTION };
+
+    await expect(service(client).createIssue({ ...base, tracker: "   " })).rejects.toMatchObject({
+      code: "VALIDATION_ERROR"
+    });
+    await expect(service(client).createIssue({ ...base, priority: " " })).rejects.toMatchObject({
+      code: "VALIDATION_ERROR"
+    });
+    await expect(service(client).createIssue({ ...base, custom_fields: { " ": "x" } })).rejects.toMatchObject({
+      code: "VALIDATION_ERROR"
+    });
+  });
+
+  it("matches a numeric reference only as an ID, never as part of a name", async () => {
+    const client = makeClient();
+    client.getProjectIssueMetadata.mockResolvedValue({
+      trackers: projectFixture.trackers,
+      issue_custom_fields: [...projectFixture.issue_custom_fields, { id: 60, name: "Etap 2" }]
+    } as never);
+
+    await expect(
+      service(client).createIssue({
+        project: "rossmannmerge",
+        subject: SUBJECT,
+        description: DESCRIPTION,
+        custom_fields: { "2": "x" }
+      })
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("ignores inactive priorities", async () => {
+    const client = makeClient();
+    client.listIssuePriorities.mockResolvedValue([
+      ...prioritiesFixture,
+      { id: 9, name: "Stary niski", is_default: false, active: false }
+    ] as never);
+
+    await expect(
+      service(client).createIssue({ project: "rossmannmerge", subject: SUBJECT, description: DESCRIPTION, priority: "Stary" })
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("rejects a custom field that is not enabled for the tracker when definitions are readable", async () => {
+    const client = makeClient({ adminFields: true });
+
+    await expect(
+      service(client).createIssue({
+        project: "rossmannmerge",
+        subject: SUBJECT,
+        description: DESCRIPTION,
+        tracker: "Błąd",
+        custom_fields: { "Analiza zadania": "x" }
+      })
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("Błąd") });
+    expect(client.createIssue).not.toHaveBeenCalled();
+  });
+
+  it("warns in the preview about a relation to another project", async () => {
     const client = makeClient();
 
     const result = await service(client).createIssue({
       project: "rossmannmerge",
       subject: SUBJECT,
-      description: DESCRIPTION
+      description: DESCRIPTION,
+      tracker: "Błąd",
+      related_issue_id: 268038
     });
 
-    expect(result.tracker).toEqual({ id: 2, name: "Zadanie", source: "project_default" });
-    expect(result.priority).toEqual({ id: 4, name: "Normalny", source: "redmine_default" });
-    expect(result.relation).toBeNull();
-    expect(result.custom_fields).toEqual([]);
+    expect(result.relation).toMatchObject({ issue: { id: 268038 } });
+    expect(result.notes.join(" ")).toMatch(/cross-project/i);
   });
 
   it("rejects an ambiguous custom field name", async () => {
@@ -303,10 +400,35 @@ describe("create_issue", () => {
     expect(client.createIssueRelation).not.toHaveBeenCalled();
   });
 
-  it("reports the created issue when a custom field did not persist", async () => {
-    const client = makeClient({
-      refetched: [{ ...createdFixture, custom_fields: [{ id: 26, name: "Rozwiązane w wersji", value: "" }] }]
+  it("still adds the relation, then reports a custom field that did not persist", async () => {
+    const dropped = { ...createdFixture, custom_fields: [{ id: 26, name: "Rozwiązane w wersji", value: "" }] };
+    const client = makeClient({ refetched: [dropped, withRelation(dropped)] });
+
+    const error = await service(client)
+      .createIssue({
+        project: "rossmannmerge",
+        subject: SUBJECT,
+        description: DESCRIPTION,
+        tracker: "Błąd",
+        priority: "Niski",
+        custom_fields: { "Ważność": "nie dotyczy" },
+        related_issue_id: 295394,
+        dry_run: false
+      })
+      .catch((caught: unknown) => caught);
+
+    expect(client.createIssueRelation).toHaveBeenCalledWith(300001, 295394, "relates");
+    expect(error).toMatchObject({
+      code: "UPSTREAM_ERROR",
+      message: expect.stringMatching(/#300001.*Ważność/s),
+      details: { issue_id: 300001, failed_step: "verification" }
     });
+    expect((error as Error).message).toMatch(/relation .*was created/);
+  });
+
+  it("still adds the relation, then reports a priority that did not persist", async () => {
+    const lowered = { ...createdFixture, priority: { id: 4, name: "Normalny" } };
+    const client = makeClient({ refetched: [lowered, withRelation(lowered)] });
 
     await expect(
       service(client).createIssue({
@@ -315,14 +437,102 @@ describe("create_issue", () => {
         description: DESCRIPTION,
         tracker: "Błąd",
         priority: "Niski",
-        custom_fields: { "Ważność": "nie dotyczy" },
+        related_issue_id: 295394,
         dry_run: false
       })
     ).rejects.toMatchObject({
       code: "UPSTREAM_ERROR",
-      message: expect.stringMatching(/#300001.*Ważność/s),
-      details: { issue_id: 300001 }
+      message: expect.stringContaining("priority"),
+      details: { issue_id: 300001, failed_step: "verification" }
     });
+    expect(client.createIssueRelation).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["project", { project: { id: 2, name: "Rossmann Systemy Centralne | Zgłoszenia" } }],
+    ["subject", { subject: "Inny temat" }]
+  ])("reports the created issue and skips the relation when the %s did not persist", async (label, change) => {
+    const client = makeClient({ refetched: [{ ...createdFixture, ...change }] });
+
+    await expect(
+      service(client).createIssue({
+        project: "rossmannmerge",
+        subject: SUBJECT,
+        description: DESCRIPTION,
+        tracker: "Błąd",
+        related_issue_id: 295394,
+        dry_run: false
+      })
+    ).rejects.toMatchObject({
+      code: "UPSTREAM_ERROR",
+      message: expect.stringContaining(label),
+      details: { issue_id: 300001, failed_step: "verification" }
+    });
+    expect(client.createIssueRelation).not.toHaveBeenCalled();
+  });
+
+  it("accepts a multi-value field that Redmine de-duplicated", async () => {
+    const deduplicated = {
+      ...createdFixture,
+      custom_fields: [{ id: 43, name: "Dotyczy", value: ["a"] }]
+    };
+    const client = makeClient({ refetched: [deduplicated] });
+
+    const result = await service(client).createIssue({
+      project: "rossmannmerge",
+      subject: SUBJECT,
+      description: DESCRIPTION,
+      tracker: "Błąd",
+      priority: "Niski",
+      custom_fields: { Dotyczy: ["a", "a"] },
+      dry_run: false
+    });
+
+    expect(result.action).toBe("created");
+  });
+
+  it("accepts a relation that Redmine stored in the reverse direction", async () => {
+    const reversed: RedmineIssue = {
+      ...createdFixture,
+      relations: [{ id: 90001, relation_type: "blocks", issue_id: testIssue.id, issue_to_id: createdFixture.id }]
+    };
+    const client = makeClient({ refetched: [createdFixture, reversed] });
+
+    const result = await service(client).createIssue({
+      project: "rossmannmerge",
+      subject: SUBJECT,
+      description: DESCRIPTION,
+      tracker: "Błąd",
+      priority: "Niski",
+      related_issue_id: 295394,
+      relation_type: "blocked",
+      dry_run: false
+    });
+
+    expect(client.createIssueRelation).toHaveBeenCalledWith(300001, 295394, "blocked");
+    expect(result.relation).toMatchObject({ type: "blocked", action: "related" });
+  });
+
+  it("says the relation was created when only the re-read after it fails", async () => {
+    const client = makeClient({
+      refetched: [createdFixture, new RedmineMcpError("UPSTREAM_ERROR", "Redmine request timed out after 15000ms.")]
+    });
+
+    const error = await service(client)
+      .createIssue({
+        project: "rossmannmerge",
+        subject: SUBJECT,
+        description: DESCRIPTION,
+        tracker: "Błąd",
+        priority: "Niski",
+        related_issue_id: 295394,
+        dry_run: false
+      })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({ code: "UPSTREAM_ERROR", details: { issue_id: 300001, failed_step: "relation" } });
+    expect((error as Error).message).toMatch(/relation to #295394 was created/);
+    expect((error as Error).message).not.toMatch(/relation to #295394 failed/);
   });
 
   it("reports a partial state when the relation step fails", async () => {

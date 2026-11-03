@@ -335,8 +335,8 @@ export interface CreateIssueResult {
   dry_run: boolean;
   action: "would_create" | "created";
   project: { id: number; name: string; identifier: string | null };
-  /** null = not resolvable up front (project trackers not exposed); Redmine picks its default. */
-  tracker: (NamedRef & { source: "input" | "project_default" }) | null;
+  /** null in a preview without input tracker: Redmine picks the first tracker the user's role may add; set after create. */
+  tracker: (NamedRef & { source: "input" | "redmine_default" }) | null;
   /** null = Redmine has no default priority configured; Redmine decides. */
   priority: (NamedRef & { source: "input" | "redmine_default" }) | null;
   subject: string;
@@ -348,6 +348,8 @@ export interface CreateIssueResult {
     missing: NamedRef[];
     note?: string;
   };
+  /** Things the preview cannot settle up front (default tracker, cross-project relation). */
+  notes: string[];
   relation: {
     type: string;
     action: "would_relate" | "related";
