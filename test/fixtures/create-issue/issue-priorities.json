@@ -1,0 +1,34 @@
+{
+  "issue_priorities": [
+    {
+      "id": 3,
+      "name": "Niski",
+      "is_default": false,
+      "active": true
+    },
+    {
+      "id": 4,
+      "name": "Normalny",
+      "is_default": true,
+      "active": true
+    },
+    {
+      "id": 5,
+      "name": "Wysoki",
+      "is_default": false,
+      "active": true
+    },
+    {
+      "id": 6,
+      "name": "Pilny",
+      "is_default": false,
+      "active": true
+    },
+    {
+      "id": 7,
+      "name": "Natychmiastowy",
+      "is_default": false,
+      "active": true
+    }
+  ]
+}

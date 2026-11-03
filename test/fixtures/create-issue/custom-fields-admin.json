@@ -1,0 +1,54 @@
+{
+  "custom_fields": [
+    {
+      "id": 1,
+      "name": "Ważność ",
+      "customized_type": "issue",
+      "field_format": "list",
+      "is_required": true,
+      "multiple": false,
+      "default_value": "",
+      "trackers": [{ "id": 1, "name": "Błąd" }, { "id": 2, "name": "Zadanie" }],
+      "possible_values": [{ "value": "nie dotyczy" }, { "value": "krytyczna" }]
+    },
+    {
+      "id": 7,
+      "name": "Status wyceny",
+      "customized_type": "issue",
+      "field_format": "list",
+      "is_required": true,
+      "multiple": false,
+      "default_value": "realizowane bezpłatnie",
+      "trackers": [{ "id": 1, "name": "Błąd" }]
+    },
+    {
+      "id": 42,
+      "name": "Analiza zadania",
+      "customized_type": "issue",
+      "field_format": "text",
+      "is_required": true,
+      "multiple": false,
+      "default_value": null,
+      "trackers": [{ "id": 2, "name": "Zadanie" }]
+    },
+    {
+      "id": 26,
+      "name": "Rozwiązane w wersji",
+      "customized_type": "issue",
+      "field_format": "string",
+      "is_required": false,
+      "multiple": false,
+      "default_value": "",
+      "trackers": [{ "id": 1, "name": "Błąd" }]
+    },
+    {
+      "id": 99,
+      "name": "Dział",
+      "customized_type": "user",
+      "field_format": "string",
+      "is_required": true,
+      "multiple": false,
+      "default_value": ""
+    }
+  ]
+}

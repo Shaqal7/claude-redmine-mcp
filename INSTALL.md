@@ -98,7 +98,7 @@ redmine: node /absolute/path/to/dist/index.js - ✓ Connected
 
 If you see `✗ Failed to connect`, see [Troubleshooting](#troubleshooting) below.
 
-Inside a Claude Code session, type `/mcp` — `redmine` should appear with all 12 tools:
+Inside a Claude Code session, type `/mcp` — `redmine` should appear with all 13 tools:
 
 - `list_issues`
 - `search_issues`
@@ -112,6 +112,7 @@ Inside a Claude Code session, type `/mcp` — `redmine` should appear with all 1
 - `attach_file_to_issue`
 - `attach_file_to_test_chain`
 - `resolve_chain_with_attachment`
+- `create_issue`
 
 Quick smoke test in Claude Code:
 
@@ -189,7 +190,7 @@ The MCP server is connected to a stale Claude Code session. Quit Claude Code ful
 - **Option A:** the API key sits in `.env`, which is gitignored. Don't commit it.
 - **Option B:** the API key is stored in plaintext inside `~/.claude.json`. The file is per-user and not committed, but it is a regular text file on disk. If you back up your home directory, the key goes with it. If you're on a shared machine, consider Option A or set the key via shell-level env vars instead of `-e` flags.
 - The MCP server enforces the **`REDMINE_ALLOWED_PROJECTS` allowlist on every issue read** — even if a related issue exists in some other project, the server refuses to fetch it. Keep the allowlist tight.
-- All write operations (notes, status changes, assignments, attachments, chain resolution) require an explicit Claude Code confirmation prompt before being executed; `resolve_related_test_chain` and `attach_file_to_test_chain` additionally default to `dry_run=true`.
+- All write operations (notes, status changes, assignments, attachments, chain resolution, issue creation) require an explicit Claude Code confirmation prompt before being executed; `resolve_related_test_chain`, `attach_file_to_test_chain`, `resolve_chain_with_attachment` and `create_issue` additionally default to `dry_run=true`.
 
 ## Uninstall
 

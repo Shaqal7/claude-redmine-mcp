@@ -15,6 +15,7 @@ Local MCP server for Claude Code that exposes a narrow, issue-focused Redmine in
 - `attach_file_to_issue` — upload a local file to one issue, optionally with a note (file is read from the MCP server's filesystem)
 - `attach_file_to_test_chain` — upload the same file to the test issue and its related external issue, with the same note on both (same-project issue is not touched; defaults to `dry_run=true`; not atomic — partial failures are surfaced)
 - `resolve_chain_with_attachment` — resolve the full test chain (status + note) AND attach a file to all three issues in a single combined journal entry per issue (defaults to `dry_run=true`; not atomic — partial failures are surfaced). Use this instead of pairing `resolve_related_test_chain` with `attach_file_to_test_chain` when you want clean issue history.
+- `create_issue` — create a new issue in an allowed project; tracker, priority and custom fields by name or ID, optional relation to an allowed issue (default `relates`). Defaults to `dry_run=true` (preview incl. required custom fields still missing, when the key can read field definitions); the created issue is re-read and verified; not atomic — if verification or the relation fails, the error carries the new issue's id and URL.
 
 The server is intentionally opinionated:
 

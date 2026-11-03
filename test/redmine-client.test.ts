@@ -135,6 +135,88 @@ describe("RedmineClient", () => {
     expect(JSON.parse(String(init.body))).toEqual({ journal: { notes: "poprawiona treść" } });
   });
 
+  it("creates issues with POST /issues.json and returns the created issue", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ issue: { id: 300001, subject: "x" } }), {
+        status: 201,
+        headers: { "content-type": "application/json" }
+      })
+    );
+    const client = new RedmineClient(config, fetchMock as typeof fetch);
+
+    const created = await client.createIssue({ project_id: 192, subject: "x", description: "y" });
+
+    const [input, init] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
+    expect(String(input)).toBe("https://redmine.example.com/issues.json");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({ issue: { project_id: 192, subject: "x", description: "y" } });
+    expect(created.id).toBe(300001);
+  });
+
+  it("rejects a create response without an issue id", async () => {
+    const client = new RedmineClient(
+      config,
+      vi.fn(async () => new Response(null, { status: 204 })) as typeof fetch
+    );
+
+    await expect(client.createIssue({ project_id: 192 })).rejects.toMatchObject({ code: "UPSTREAM_ERROR" });
+  });
+
+  it("creates relations with POST /issues/{id}/relations.json", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({ relation: { id: 1, issue_id: 300001, issue_to_id: 295394, relation_type: "relates" } }),
+        { status: 201, headers: { "content-type": "application/json" } }
+      )
+    );
+    const client = new RedmineClient(config, fetchMock as typeof fetch);
+
+    const relation = await client.createIssueRelation(300001, 295394, "relates");
+
+    const [input, init] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
+    expect(String(input)).toBe("https://redmine.example.com/issues/300001/relations.json");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({ relation: { issue_to_id: 295394, relation_type: "relates" } });
+    expect(relation.issue_to_id).toBe(295394);
+  });
+
+  it("reads project trackers and issue custom fields, priorities, trackers and issue custom field definitions", async () => {
+    const urls: URL[] = [];
+    const bodies: Record<string, unknown> = {
+      "/projects/rossmannmerge.json": {
+        project: { id: 192, name: "M", identifier: "rossmannmerge", trackers: [{ id: 1, name: "Błąd" }], issue_custom_fields: [{ id: 1, name: "Ważność " }] }
+      },
+      "/enumerations/issue_priorities.json": { issue_priorities: [{ id: 3, name: "Niski", is_default: false, active: true }] },
+      "/trackers.json": { trackers: [{ id: 1, name: "Błąd", default_status: { id: 1, name: "Nowy" } }] },
+      "/custom_fields.json": {
+        custom_fields: [
+          { id: 1, name: "Ważność ", customized_type: "issue", is_required: true },
+          { id: 99, name: "Dział", customized_type: "user", is_required: true }
+        ]
+      }
+    };
+    const fetchMock = vi.fn(async (input: URL | RequestInfo) => {
+      const url = new URL(String(input));
+      urls.push(url);
+      return new Response(JSON.stringify(bodies[url.pathname]), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    });
+    const client = new RedmineClient(config, fetchMock as typeof fetch);
+
+    const metadata = await client.getProjectIssueMetadata("rossmannmerge");
+    const priorities = await client.listIssuePriorities();
+    const trackers = await client.listTrackers();
+    const definitions = await client.listIssueCustomFieldDefinitions();
+
+    expect(urls[0]?.searchParams.get("include")).toBe("trackers,issue_custom_fields");
+    expect(metadata).toEqual({ trackers: [{ id: 1, name: "Błąd" }], issue_custom_fields: [{ id: 1, name: "Ważność " }] });
+    expect(priorities).toEqual([{ id: 3, name: "Niski", is_default: false, active: true }]);
+    expect(trackers).toEqual([{ id: 1, name: "Błąd" }]);
+    expect(definitions.map((definition) => definition.id)).toEqual([1]);
+  });
+
   it("maps 422 responses to validation errors", async () => {
     const client = new RedmineClient(
       config,

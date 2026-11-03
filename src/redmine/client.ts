@@ -2,16 +2,25 @@ import { RedmineMcpError } from "../errors.js";
 import type {
   AppConfig,
   NamedRef,
+  ProjectIssueMetadata,
   ProjectRef,
   RedmineCurrentUserResponse,
+  RedmineCustomFieldDefinition,
+  RedmineCustomFieldsResponse,
   RedmineIssue,
   RedmineIssueListResponse,
+  RedmineIssuePrioritiesResponse,
+  RedmineIssuePriority,
   RedmineIssueResponse,
   RedmineMembership,
   RedmineMembershipsResponse,
+  RedmineProjectIssueMetadataResponse,
   RedmineProjectResponse,
+  RedmineRelation,
+  RedmineRelationResponse,
   RedmineSearchResponse,
   RedmineStatusesResponse,
+  RedmineTrackersResponse,
   RedmineUploadResponse
 } from "../types.js";
 
@@ -173,6 +182,61 @@ export class RedmineClient {
         issue: issuePatch
       }
     });
+  }
+
+  public async createIssue(issue: Record<string, unknown>): Promise<RedmineIssue> {
+    const response = await this.request<RedmineIssueResponse | undefined>("/issues.json", {
+      method: "POST",
+      body: { issue }
+    });
+
+    if (!response?.issue?.id) {
+      throw new RedmineMcpError("UPSTREAM_ERROR", "Redmine create-issue response did not contain the new issue id.");
+    }
+
+    return response.issue;
+  }
+
+  public async createIssueRelation(issueId: number, issueToId: number, relationType: string): Promise<RedmineRelation> {
+    const response = await this.request<RedmineRelationResponse>(`/issues/${issueId}/relations.json`, {
+      method: "POST",
+      body: {
+        relation: { issue_to_id: issueToId, relation_type: relationType }
+      }
+    });
+
+    return response.relation;
+  }
+
+  /** Trackers and issue custom fields enabled in one project; either is undefined if this Redmine ignores the include. */
+  public async getProjectIssueMetadata(projectRef: string | number): Promise<ProjectIssueMetadata> {
+    const response = await this.request<RedmineProjectIssueMetadataResponse>(
+      `/projects/${encodeURIComponent(String(projectRef))}.json`,
+      {
+        query: { include: "trackers,issue_custom_fields" }
+      }
+    );
+
+    return {
+      trackers: response.project.trackers,
+      issue_custom_fields: response.project.issue_custom_fields
+    };
+  }
+
+  public async listTrackers(): Promise<NamedRef[]> {
+    const response = await this.request<RedmineTrackersResponse>("/trackers.json");
+    return response.trackers.map((tracker) => ({ id: tracker.id, name: tracker.name }));
+  }
+
+  public async listIssuePriorities(): Promise<RedmineIssuePriority[]> {
+    const response = await this.request<RedmineIssuePrioritiesResponse>("/enumerations/issue_priorities.json");
+    return response.issue_priorities;
+  }
+
+  /** Admin-only in Redmine: non-admin keys get AUTH_ERROR (403). */
+  public async listIssueCustomFieldDefinitions(): Promise<RedmineCustomFieldDefinition[]> {
+    const response = await this.request<RedmineCustomFieldsResponse>("/custom_fields.json");
+    return response.custom_fields.filter((field) => field.customized_type === "issue");
   }
 
   public async uploadAttachment(filename: string, bytes: Uint8Array): Promise<string> {
