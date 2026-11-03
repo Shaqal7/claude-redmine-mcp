@@ -95,12 +95,18 @@ function makeClient(
       issue_id: issueId,
       issue_to_id: issueToId,
       relation_type: relationType
-    }))
+    })),
+    uploadAttachment: vi.fn(async (filename: string) => `token-${filename}`)
   };
 }
 
-function service(client: ReturnType<typeof makeClient>) {
-  return new RedmineService(client as never, ["rossmannmerge", "poligon"], ["poligon"]);
+function service(client: ReturnType<typeof makeClient>, files: Map<string, Uint8Array> = new Map()) {
+  const readFile = async (filePath: string) => {
+    const bytes = files.get(filePath);
+    if (!bytes) throw new Error(`ENOENT: no such file or directory, open '${filePath}'`);
+    return bytes;
+  };
+  return new RedmineService(client as never, ["rossmannmerge", "poligon"], ["poligon"], readFile);
 }
 
 const withRelation = (issue: RedmineIssue): RedmineIssue => ({
@@ -610,5 +616,140 @@ describe("create_issue", () => {
       code: "VALIDATION_ERROR",
       message: expect.stringContaining("numeric ID")
     });
+  });
+});
+
+describe("create_issue attachments", () => {
+  const SCREENSHOT_NAME = "Zrzut ekranu 2026-11-03 141516.png";
+  const SCREENSHOT = `C:/Users/tsmierzchala/Pictures/Screenshots/${SCREENSHOT_NAME}`;
+  const LOG = "C:/logs/pos.log";
+  const files = new Map<string, Uint8Array>([
+    [SCREENSHOT, new Uint8Array([137, 80, 78, 71])],
+    [LOG, new Uint8Array([79, 75])],
+    ["C:/logs/empty.log", new Uint8Array()]
+  ]);
+  const screenshotEntry = { filename: SCREENSHOT_NAME, content_type: "image/png", size: 4 };
+  const logEntry = { filename: "pos.log", content_type: "text/plain", size: 2 };
+  const base = { project: "rossmannmerge", subject: SUBJECT, description: DESCRIPTION, tracker: "Błąd", priority: "Niski" };
+  const withAttachments = (issue: RedmineIssue, filenames: string[]): RedmineIssue => ({
+    ...issue,
+    attachments: filenames.map((filename, index) => ({ id: 7000 + index, filename }))
+  });
+
+  it("lists every attachment in a dry-run preview without uploading", async () => {
+    const client = makeClient();
+
+    const result = await service(client, files).createIssue({ ...base, attachments: [SCREENSHOT, ` ${LOG} `] });
+
+    expect(result.attachments).toEqual([screenshotEntry, logEntry]);
+    expect(client.uploadAttachment).not.toHaveBeenCalled();
+    expect(client.createIssue).not.toHaveBeenCalled();
+    expect((await service(client, files).createIssue(base)).attachments).toEqual([]);
+  });
+
+  it.each([
+    ["a missing file", "C:/logs/missing.log", /Unable to read file "C:\/logs\/missing.log"/],
+    ["an empty file", "C:/logs/empty.log", /empty/],
+    ["a blank path", "   ", /must not be blank/]
+  ])("rejects %s before any write", async (_label, path, message) => {
+    const client = makeClient();
+
+    await expect(
+      service(client, files).createIssue({ ...base, attachments: [SCREENSHOT, path], dry_run: false })
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringMatching(message) });
+    expect(client.uploadAttachment).not.toHaveBeenCalled();
+    expect(client.createIssue).not.toHaveBeenCalled();
+  });
+
+  it("rejects two attachments with the same file name", async () => {
+    const client = makeClient();
+    const twins = new Map([...files, ["C:/old/POS.log", new Uint8Array([1])]]);
+
+    await expect(
+      service(client, twins).createIssue({ ...base, attachments: [LOG, "C:/old/POS.log"] })
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("pos.log") });
+  });
+
+  it("uploads every file first and sends the tokens in the create request", async () => {
+    const client = makeClient({ refetched: [withAttachments(createdFixture, [SCREENSHOT_NAME, "pos.log"])] });
+
+    const result = await service(client, files).createIssue({
+      ...base,
+      description: `${DESCRIPTION}\n\n!Zrzut%20ekranu%202026-11-03%20141516.png!`,
+      attachments: [SCREENSHOT, LOG],
+      dry_run: false
+    });
+
+    expect(client.uploadAttachment.mock.calls).toEqual([
+      [SCREENSHOT_NAME, files.get(SCREENSHOT)],
+      ["pos.log", files.get(LOG)]
+    ]);
+    expect(client.createIssue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        uploads: [
+          { token: `token-${SCREENSHOT_NAME}`, filename: SCREENSHOT_NAME, content_type: "image/png" },
+          { token: "token-pos.log", filename: "pos.log", content_type: "text/plain" }
+        ]
+      })
+    );
+    expect(client.uploadAttachment.mock.invocationCallOrder[1]).toBeLessThan(
+      client.createIssue.mock.invocationCallOrder[0]!
+    );
+    expect(result.action).toBe("created");
+    expect(result.attachments).toEqual([screenshotEntry, logEntry]);
+  });
+
+  it("names an attachment the way Redmine stores it", async () => {
+    const quoted = "C:/logs/kasa 'A' 50%.log";
+    const client = makeClient({ refetched: [withAttachments(createdFixture, ["kasa _A_ 50_.log"])] });
+
+    const preview = await service(client, new Map([[quoted, new Uint8Array([1])]])).createIssue({
+      ...base,
+      attachments: [quoted]
+    });
+    expect(preview.attachments).toEqual([{ filename: "kasa _A_ 50_.log", content_type: "text/plain", size: 1 }]);
+
+    await service(client, new Map([[quoted, new Uint8Array([1])]])).createIssue({
+      ...base,
+      attachments: [quoted],
+      dry_run: false
+    });
+    expect(client.uploadAttachment).toHaveBeenCalledWith("kasa _A_ 50_.log", expect.any(Uint8Array));
+  });
+
+  it.each([
+    ["UPSTREAM_ERROR", "Redmine request timed out after 15000ms."],
+    ["VALIDATION_ERROR", "Redmine rejected the request: Plik jest za duży"]
+  ] as const)("creates nothing when an upload fails with %s", async (code, reason) => {
+    const client = makeClient();
+    client.uploadAttachment
+      .mockResolvedValueOnce("token-1")
+      .mockRejectedValueOnce(new RedmineMcpError(code, reason));
+
+    await expect(
+      service(client, files).createIssue({ ...base, attachments: [SCREENSHOT, LOG], dry_run: false })
+    ).rejects.toMatchObject({
+      code,
+      message: expect.stringMatching(/pos\.log.*No issue was created/s)
+    });
+    expect(client.createIssue).not.toHaveBeenCalled();
+  });
+
+  it("still adds the relation, then reports an attachment missing after create", async () => {
+    const partial = withAttachments(createdFixture, [SCREENSHOT_NAME]);
+    const client = makeClient({ refetched: [partial, withRelation(partial)] });
+
+    const error = await service(client, files)
+      .createIssue({ ...base, attachments: [SCREENSHOT, LOG], related_issue_id: 295394, dry_run: false })
+      .catch((caught: unknown) => caught);
+
+    expect(client.createIssueRelation).toHaveBeenCalledWith(300001, 295394, "relates");
+    expect(error).toMatchObject({
+      code: "UPSTREAM_ERROR",
+      message: expect.stringMatching(/#300001.*attachment "pos\.log"/s),
+      details: { issue_id: 300001, url: `${BASE_URL}/issues/300001`, failed_step: "verification" }
+    });
+    expect((error as Error).message).not.toContain(SCREENSHOT_NAME);
+    expect((error as Error).message).toMatch(/relation .*was created/);
   });
 });
