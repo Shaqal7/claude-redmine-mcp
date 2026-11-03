@@ -709,7 +709,8 @@ export class RedmineService {
       attachments: attachments.map((attachment) => ({
         filename: attachment.filename,
         content_type: attachment.contentType,
-        size: attachment.bytes.byteLength
+        size: attachment.bytes.byteLength,
+        embed: inlineImageEmbed(attachment.filename)
       })),
       required_custom_fields: requiredCustomFields,
       notes,
@@ -1266,8 +1267,26 @@ function contentTypeForExtension(extension: string): string {
 }
 
 /** Redmine's Attachment#sanitize_filename: the name it stores, and the one a description has to embed. */
-function redmineStoredFilename(filename: string): string {
-  return filename.replace(/[/?%*:|"'<>\n\r]+/g, "_");
+export function redmineStoredFilename(filename: string): string {
+  return filename.replace(/^.*[\\/]/s, "").replace(/[/?%*:|"'<>\n\r]+/g, "_");
+}
+
+const INLINE_IMAGE_EXTENSION = /\.(bmp|gif|jpg|jpe|jpeg|png|webp)$/i;
+
+/**
+ * Textile that shows the image in a description, or null when Redmine does not inline that type.
+ * Redmine CGI-unescapes the src (a "+" would become a space) and Textile ends the src at "(", "!" or a space,
+ * so everything but [A-Za-z0-9-_.~] is percent-encoded.
+ */
+function inlineImageEmbed(filename: string): string | null {
+  if (!INLINE_IMAGE_EXTENSION.test(filename)) {
+    return null;
+  }
+  const encoded = encodeURIComponent(filename).replace(
+    /[!'()*]/g,
+    (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`
+  );
+  return `!${encoded}!`;
 }
 
 function normalizeRelationType(relatedIssueId: number | undefined, relationType: string | undefined): string | undefined {

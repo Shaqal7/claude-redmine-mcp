@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 
 import { RedmineMcpError } from "../src/errors.js";
-import { RedmineService } from "../src/service.js";
+import { RedmineService, redmineStoredFilename } from "../src/service.js";
 import type { ProjectRef, RedmineIssue } from "../src/types.js";
 
 function fixture<T>(name: string): T {
@@ -628,8 +628,13 @@ describe("create_issue attachments", () => {
     [LOG, new Uint8Array([79, 75])],
     ["C:/logs/empty.log", new Uint8Array()]
   ]);
-  const screenshotEntry = { filename: SCREENSHOT_NAME, content_type: "image/png", size: 4 };
-  const logEntry = { filename: "pos.log", content_type: "text/plain", size: 2 };
+  const screenshotEntry = {
+    filename: SCREENSHOT_NAME,
+    content_type: "image/png",
+    size: 4,
+    embed: "!Zrzut%20ekranu%202026-11-03%20141516.png!"
+  };
+  const logEntry = { filename: "pos.log", content_type: "text/plain", size: 2, embed: null };
   const base = { project: "rossmannmerge", subject: SUBJECT, description: DESCRIPTION, tracker: "Błąd", priority: "Niski" };
   const withAttachments = (issue: RedmineIssue, filenames: string[]): RedmineIssue => ({
     ...issue,
@@ -657,6 +662,7 @@ describe("create_issue attachments", () => {
     await expect(
       service(client, files).createIssue({ ...base, attachments: [SCREENSHOT, path], dry_run: false })
     ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringMatching(message) });
+    expect(client.getProject).not.toHaveBeenCalled();
     expect(client.uploadAttachment).not.toHaveBeenCalled();
     expect(client.createIssue).not.toHaveBeenCalled();
   });
@@ -707,7 +713,9 @@ describe("create_issue attachments", () => {
       ...base,
       attachments: [quoted]
     });
-    expect(preview.attachments).toEqual([{ filename: "kasa _A_ 50_.log", content_type: "text/plain", size: 1 }]);
+    expect(preview.attachments).toEqual([
+      { filename: "kasa _A_ 50_.log", content_type: "text/plain", size: 1, embed: null }
+    ]);
 
     await service(client, new Map([[quoted, new Uint8Array([1])]])).createIssue({
       ...base,
@@ -717,6 +725,24 @@ describe("create_issue attachments", () => {
     expect(client.uploadAttachment).toHaveBeenCalledWith("kasa _A_ 50_.log", expect.any(Uint8Array));
   });
 
+  it("drops everything up to the last backslash, as Redmine does on any host", () => {
+    expect(redmineStoredFilename("a\\b.png")).toBe("b.png");
+    expect(redmineStoredFilename("kasa 'A' 50%.log")).toBe("kasa _A_ 50_.log");
+  });
+
+  it("gives an image an embed string that survives Textile and Redmine's unescaping", async () => {
+    const odd = "C:/logs/C++ log (2)!.PNG";
+    const client = makeClient();
+
+    const preview = await service(client, new Map([[odd, new Uint8Array([1])]])).createIssue({
+      ...base,
+      attachments: [odd]
+    });
+
+    // CGI.unescape turns "+" into a space; "(" and "!" end the Textile image src.
+    expect(preview.attachments[0]?.embed).toBe("!C%2B%2B%20log%20%282%29%21.PNG!");
+  });
+
   it.each([
     ["UPSTREAM_ERROR", "Redmine request timed out after 15000ms."],
     ["VALIDATION_ERROR", "Redmine rejected the request: Plik jest za duży"]
@@ -724,13 +750,14 @@ describe("create_issue attachments", () => {
     const client = makeClient();
     client.uploadAttachment
       .mockResolvedValueOnce("token-1")
-      .mockRejectedValueOnce(new RedmineMcpError(code, reason));
+      .mockRejectedValueOnce(new RedmineMcpError(code, reason, { status: 422, errors: ["Plik jest za duży"] }));
 
     await expect(
       service(client, files).createIssue({ ...base, attachments: [SCREENSHOT, LOG], dry_run: false })
     ).rejects.toMatchObject({
       code,
-      message: expect.stringMatching(/pos\.log.*No issue was created/s)
+      message: expect.stringMatching(/pos\.log.*No issue was created/s),
+      details: { status: 422, errors: ["Plik jest za duży"] }
     });
     expect(client.createIssue).not.toHaveBeenCalled();
   });
