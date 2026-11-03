@@ -6,7 +6,7 @@ import { z } from "zod";
 
 import { loadConfig } from "./config.js";
 import { RedmineClient } from "./redmine/client.js";
-import { RedmineService } from "./service.js";
+import { RELATION_TYPES, RedmineService } from "./service.js";
 import { createToolHandlers } from "./tool-handlers.js";
 
 const config = loadConfig();
@@ -141,6 +141,22 @@ server.registerTool("attach_file_to_test_chain", {
     dry_run: z.boolean().optional()
   }
 }, handlers.attachFileToTestChain);
+
+server.registerTool("create_issue", {
+  description:
+    "Create a new issue in one allowed Redmine project. project is an identifier or ID; tracker, priority and custom field keys accept an ID or name (exact, then a unique partial match; a numeric value is an ID only). Without tracker Redmine picks the first tracker your role may add issues for (reported after the create); without priority Redmine's default priority is used. A tracker your role may not use is silently replaced by Redmine, which the verification reports. description is Textile, sent as-is. custom_fields maps a field name or ID to its value (array for multi-value fields). related_issue_id (must be in an allowed project) adds a relation from the new issue, relation_type default 'relates'. Defaults to dry_run=true, which writes nothing and returns a preview (resolved project, tracker, priority, custom fields, relation, required custom fields still missing when Redmine exposes them, notes on what cannot be settled up front such as a cross-project relation) — show it to the user and call dry_run=false only after explicit user confirmation. The created issue is re-read and verified. Not atomic: if verification or the relation step fails, the issue stays created (a wrong project, tracker or subject skips the relation; a dropped priority or custom field does not) and the error carries its id and URL — never retry create_issue then, it would create a duplicate.",
+  inputSchema: {
+    project: z.string().min(1),
+    subject: z.string().min(1).max(255),
+    description: z.string().min(1),
+    tracker: z.string().min(1).optional(),
+    priority: z.string().min(1).optional(),
+    custom_fields: z.record(z.string(), z.union([z.string(), z.array(z.string())])).optional(),
+    related_issue_id: z.number().int().positive().optional(),
+    relation_type: z.enum(RELATION_TYPES).optional(),
+    dry_run: z.boolean().optional()
+  }
+}, handlers.createIssue);
 
 const transport = new StdioServerTransport();
 

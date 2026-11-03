@@ -1,0 +1,75 @@
+{
+  "project": {
+    "id": 192,
+    "name": "Market3 Merge Rossmann",
+    "identifier": "rossmannmerge",
+    "trackers": [
+      {
+        "id": 2,
+        "name": "Zadanie"
+      },
+      {
+        "id": 1,
+        "name": "Błąd"
+      },
+      {
+        "id": 3,
+        "name": "Wsparcie"
+      },
+      {
+        "id": 12,
+        "name": "Test"
+      },
+      {
+        "id": 15,
+        "name": "Potrzeba"
+      }
+    ],
+    "issue_custom_fields": [
+      {
+        "id": 1,
+        "name": "Ważność "
+      },
+      {
+        "id": 4,
+        "name": "Sprint Id"
+      },
+      {
+        "id": 5,
+        "name": "Czas pozostały"
+      },
+      {
+        "id": 6,
+        "name": "Wersja"
+      },
+      {
+        "id": 7,
+        "name": "Status wyceny"
+      },
+      {
+        "id": 13,
+        "name": "Rewizja"
+      },
+      {
+        "id": 24,
+        "name": "Wynik testu"
+      },
+      {
+        "id": 26,
+        "name": "Rozwiązane w wersji"
+      },
+      {
+        "id": 42,
+        "name": "Analiza zadania"
+      },
+      {
+        "id": 43,
+        "name": "Dotyczy"
+      },
+      {
+        "id": 53,
+        "name": "Build status"
+      }
+    ]
+  }
+}

@@ -62,7 +62,18 @@ export function createToolHandlers(service: RedmineService) {
       status?: string;
       external_projects?: string[];
       dry_run?: boolean;
-    }): Promise<ToolResponse> => handleTool(async () => service.resolveChainWithAttachment(input))
+    }): Promise<ToolResponse> => handleTool(async () => service.resolveChainWithAttachment(input)),
+    createIssue: async (input: {
+      project: string;
+      subject: string;
+      description: string;
+      tracker?: string;
+      priority?: string;
+      custom_fields?: Record<string, string | string[]>;
+      related_issue_id?: number;
+      relation_type?: string;
+      dry_run?: boolean;
+    }): Promise<ToolResponse> => handleTool(async () => service.createIssue(input))
   };
 }
 

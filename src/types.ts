@@ -122,6 +122,45 @@ export interface RedmineProjectResponse {
   project: ProjectRef;
 }
 
+export interface ProjectIssueMetadata {
+  /** Undefined when this Redmine ignores include=trackers. */
+  trackers?: NamedRef[];
+  /** Undefined when this Redmine ignores include=issue_custom_fields. */
+  issue_custom_fields?: NamedRef[];
+}
+
+export interface RedmineProjectIssueMetadataResponse {
+  project: ProjectRef & ProjectIssueMetadata;
+}
+
+export interface RedmineTrackersResponse {
+  trackers: NamedRef[];
+}
+
+export interface RedmineIssuePriority extends NamedRef {
+  is_default?: boolean;
+  active?: boolean;
+}
+
+export interface RedmineIssuePrioritiesResponse {
+  issue_priorities: RedmineIssuePriority[];
+}
+
+export interface RedmineCustomFieldDefinition extends NamedRef {
+  customized_type?: string;
+  is_required?: boolean;
+  default_value?: string | null;
+  trackers?: NamedRef[];
+}
+
+export interface RedmineCustomFieldsResponse {
+  custom_fields: RedmineCustomFieldDefinition[];
+}
+
+export interface RedmineRelationResponse {
+  relation: RedmineRelation;
+}
+
 export interface RedmineStatusesResponse {
   issue_statuses: Array<NamedRef & { is_closed?: boolean }>;
 }
@@ -284,4 +323,39 @@ export interface ResolveChainWithAttachmentResult {
   attachment: AttachmentDescriptor;
   external_projects: string[];
   steps: ResolveChainWithAttachmentStep[];
+}
+
+export interface CreateIssueCustomField {
+  id: number;
+  name: string;
+  value: string | string[];
+}
+
+export interface CreateIssueResult {
+  dry_run: boolean;
+  action: "would_create" | "created";
+  project: { id: number; name: string; identifier: string | null };
+  /** null in a preview without input tracker: Redmine picks the first tracker the user's role may add; set after create. */
+  tracker: (NamedRef & { source: "input" | "redmine_default" }) | null;
+  /** null = Redmine has no default priority configured; Redmine decides. */
+  priority: (NamedRef & { source: "input" | "redmine_default" }) | null;
+  subject: string;
+  description: string;
+  custom_fields: CreateIssueCustomField[];
+  required_custom_fields: {
+    /** false when the field definitions are not readable with this API key (admin-only endpoint). */
+    known: boolean;
+    missing: NamedRef[];
+    note?: string;
+  };
+  /** Things the preview cannot settle up front (default tracker, cross-project relation). */
+  notes: string[];
+  relation: {
+    type: string;
+    action: "would_relate" | "related";
+    issue: NormalizedIssueSummary;
+  } | null;
+  issue_id: number | null;
+  url: string | null;
+  issue: NormalizedIssueSummary | null;
 }

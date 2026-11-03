@@ -7,10 +7,14 @@ import { ProjectPolicy } from "./redmine/policy.js";
 import type {
   AttachFileToChainResult,
   AttachmentDescriptor,
+  CreateIssueCustomField,
+  CreateIssueResult,
   ListIssuesResult,
   NamedRef,
   NormalizedIssueDetail,
+  ProjectIssueMetadata,
   ProjectRef,
+  RedmineCustomFieldDefinition,
   RedmineIssue,
   ResolveChainWithAttachmentResult,
   ResolveRelatedTestChainResult,
@@ -27,6 +31,20 @@ const MAX_SEARCH_SCAN = 100;
 const FULLTEXT_PAGE_SIZE = 100;
 const MAX_FULLTEXT_HITS_PER_PROJECT = 2000;
 const DEFAULT_RESOLVE_STATUS = "Rozwiązany";
+const MAX_SUBJECT_LENGTH = 255;
+const DEFAULT_RELATION_TYPE = "relates";
+// Redmine IssueRelation::TYPES (relations to an existing issue; no precedes/follows delay support).
+export const RELATION_TYPES = [
+  "relates",
+  "duplicates",
+  "duplicated",
+  "blocks",
+  "blocked",
+  "precedes",
+  "follows",
+  "copied_to",
+  "copied_from"
+] as const;
 
 export class RedmineService {
   private readonly policy: ProjectPolicy;
@@ -630,6 +648,255 @@ export class RedmineService {
     };
   }
 
+  public async createIssue(input: {
+    project: string;
+    subject: string;
+    description: string;
+    tracker?: string;
+    priority?: string;
+    custom_fields?: Record<string, string | string[]>;
+    related_issue_id?: number;
+    relation_type?: string;
+    dry_run?: boolean;
+  }): Promise<CreateIssueResult> {
+    const subject = input.subject.trim();
+    if (!subject) {
+      throw new RedmineMcpError("VALIDATION_ERROR", "Subject must not be empty.");
+    }
+    if (subject.length > MAX_SUBJECT_LENGTH) {
+      throw new RedmineMcpError("VALIDATION_ERROR", `Subject must be at most ${MAX_SUBJECT_LENGTH} characters.`);
+    }
+    if (!input.description.trim()) {
+      throw new RedmineMcpError("VALIDATION_ERROR", "Description must not be empty.");
+    }
+    const relationType = normalizeRelationType(input.related_issue_id, input.relation_type);
+    const dryRun = input.dry_run ?? true;
+
+    const project = await this.resolveProject(input.project);
+    const relatedIssue =
+      input.related_issue_id === undefined ? undefined : await this.getAuthorizedIssue(input.related_issue_id);
+    const metadata = await this.client.getProjectIssueMetadata(project.identifier ?? project.id);
+    const tracker = await this.resolveNewIssueTracker(project, metadata, input.tracker);
+    const priority = await this.resolveNewIssuePriority(input.priority);
+    const customFields = resolveNewIssueCustomFields(project, metadata, input.custom_fields ?? {});
+    const requiredCustomFields = await this.checkCustomFieldDefinitions(metadata, tracker, customFields);
+
+    const notes: string[] = [];
+    if (!tracker) {
+      const order = metadata.trackers ? ` (project order: ${metadata.trackers.map((entry) => entry.name).join(", ")})` : "";
+      notes.push(
+        `No tracker given: Redmine picks the first tracker your role may add issues for${order}; the API does not say which one that is.`
+      );
+    }
+    if (relatedIssue && relatedIssue.project.id !== project.id) {
+      notes.push(
+        `#${relatedIssue.id} is in project "${relatedIssue.project.name}": Redmine rejects cross-project relations unless the cross_project_issue_relations setting is on; then the issue is created but the relation fails.`
+      );
+    }
+
+    const baseUrl = this.client.getBaseUrl();
+    const preview: CreateIssueResult = {
+      dry_run: dryRun,
+      action: "would_create",
+      project: { id: project.id, name: project.name, identifier: project.identifier ?? null },
+      tracker,
+      priority,
+      subject,
+      description: input.description,
+      custom_fields: customFields,
+      required_custom_fields: requiredCustomFields,
+      notes,
+      relation: relatedIssue && relationType
+        ? { type: relationType, action: "would_relate", issue: normalizeIssueSummary(relatedIssue, baseUrl) }
+        : null,
+      issue_id: null,
+      url: null,
+      issue: null
+    };
+    if (dryRun) {
+      return preview;
+    }
+
+    const payload: Record<string, unknown> = {
+      project_id: project.id,
+      subject,
+      description: input.description
+    };
+    if (tracker) {
+      payload.tracker_id = tracker.id;
+    }
+    if (priority) {
+      payload.priority_id = priority.id;
+    }
+    if (customFields.length > 0) {
+      payload.custom_fields = customFields.map((field) => ({ id: field.id, value: field.value }));
+    }
+
+    let created: RedmineIssue;
+    try {
+      created = await this.client.createIssue(payload);
+    } catch (error) {
+      // A timeout or 5xx may still have created the issue on the Redmine side.
+      if (error instanceof RedmineMcpError && error.code === "UPSTREAM_ERROR") {
+        throw new RedmineMcpError(
+          "UPSTREAM_ERROR",
+          `Creating the issue failed: ${reasonOf(error)}. The outcome is unknown: check project "${project.name}" for a new issue "${subject}" before retrying, to avoid a duplicate.`,
+          error.details
+        );
+      }
+      throw error;
+    }
+
+    const createdRef = { issue_id: created.id, url: `${baseUrl}/issues/${created.id}` };
+    const partialFailure = (step: "verification" | "relation", reason: string) =>
+      new RedmineMcpError(
+        "UPSTREAM_ERROR",
+        `Issue #${created.id} was created (${createdRef.url}) but ${reason} Fix it in Redmine; do not re-run create_issue, it would create a duplicate.`,
+        { ...createdRef, failed_step: step }
+      );
+
+    let persisted: RedmineIssue;
+    try {
+      persisted = await this.getAuthorizedIssue(created.id);
+    } catch (error) {
+      throw partialFailure("verification", `re-reading it failed: ${reasonOf(error)}.`);
+    }
+    // A wrong project, tracker or subject means the wrong issue exists: stop before relating it.
+    // A dropped priority or custom field is fixable in place, so the relation is still added first.
+    const { identity, details } = describePersistenceProblems(persisted, {
+      project,
+      tracker,
+      priority,
+      subject,
+      customFields
+    });
+    if (identity.length > 0) {
+      const skipped = relatedIssue ? " The relation step was skipped." : "";
+      throw partialFailure("verification", `Redmine did not persist: ${[...identity, ...details].join("; ")}.${skipped}`);
+    }
+
+    const alsoNotPersisted = details.length > 0 ? ` Also not persisted: ${details.join("; ")}.` : "";
+    let relationCreated = "";
+    if (relatedIssue && relationType) {
+      const relationLabel = `the "${relationType}" relation to #${relatedIssue.id}`;
+      try {
+        await this.client.createIssueRelation(created.id, relatedIssue.id, relationType);
+      } catch (error) {
+        throw partialFailure("relation", `adding ${relationLabel} failed: ${reasonOf(error)}.${alsoNotPersisted}`);
+      }
+      try {
+        persisted = await this.getAuthorizedIssue(created.id);
+      } catch (error) {
+        throw partialFailure(
+          "relation",
+          `${relationLabel} was created and re-reading the issue afterwards failed: ${reasonOf(error)}. Check the relation in Redmine.${alsoNotPersisted}`
+        );
+      }
+      if (!hasRelationBetween(persisted, relatedIssue.id)) {
+        throw partialFailure("relation", `Redmine accepted ${relationLabel} but did not persist it.${alsoNotPersisted}`);
+      }
+      relationCreated = ` The "${relationType}" relation to #${relatedIssue.id} was created.`;
+    }
+
+    if (details.length > 0) {
+      throw partialFailure("verification", `Redmine did not persist: ${details.join("; ")}.${relationCreated}`);
+    }
+
+    return {
+      ...preview,
+      action: "created",
+      tracker: tracker ?? (persisted.tracker ? { ...persisted.tracker, source: "redmine_default" } : null),
+      relation: preview.relation ? { ...preview.relation, action: "related" } : null,
+      issue_id: created.id,
+      url: createdRef.url,
+      issue: normalizeIssueSummary(persisted, baseUrl)
+    };
+  }
+
+  private async resolveNewIssueTracker(
+    project: ProjectRef,
+    metadata: ProjectIssueMetadata,
+    trackerRef?: string
+  ): Promise<CreateIssueResult["tracker"]> {
+    if (trackerRef === undefined) {
+      // Redmine's default is the first tracker the user's role may add issues for, which the API does not expose,
+      // so the tracker is left to Redmine and reported after the create.
+      return null;
+    }
+
+    // Redmine silently replaces a tracker_id the role may not use; read-after-write catches that.
+    const trackers = metadata.trackers ?? (await this.client.listTrackers());
+    const tracker = matchNamedRef(trackerRef, trackers, "Tracker", `project "${project.name}"`);
+    return { id: tracker.id, name: tracker.name, source: "input" };
+  }
+
+  private async resolveNewIssuePriority(priorityRef?: string): Promise<CreateIssueResult["priority"]> {
+    const priorities = (await this.client.listIssuePriorities()).filter((priority) => priority.active !== false);
+    if (priorityRef !== undefined) {
+      const priority = matchNamedRef(priorityRef, priorities, "Priority", "Redmine issue priorities");
+      return { id: priority.id, name: priority.name, source: "input" };
+    }
+
+    const fallback = priorities.find((priority) => priority.is_default);
+    return fallback ? { id: fallback.id, name: fallback.name, source: "redmine_default" } : null;
+  }
+
+  /**
+   * With readable field definitions (admin keys only): rejects given fields not enabled for the tracker,
+   * which Redmine would drop silently, and lists required fields still missing.
+   */
+  private async checkCustomFieldDefinitions(
+    metadata: ProjectIssueMetadata,
+    tracker: CreateIssueResult["tracker"],
+    provided: CreateIssueCustomField[]
+  ): Promise<CreateIssueResult["required_custom_fields"]> {
+    const unknown = (note: string) => ({ known: false, missing: [], note });
+
+    let definitions: RedmineCustomFieldDefinition[];
+    try {
+      definitions = await this.client.listIssueCustomFieldDefinitions();
+    } catch (error) {
+      if (error instanceof RedmineMcpError && (error.code === "AUTH_ERROR" || error.code === "NOT_FOUND")) {
+        return unknown(
+          "Custom field definitions (/custom_fields.json) are readable only by Redmine admins, so required fields are unknown. Redmine checks them on create and rejects a missing one with VALIDATION_ERROR (nothing is created)."
+        );
+      }
+      throw error;
+    }
+    if (!metadata.issue_custom_fields || !tracker) {
+      return unknown(
+        "Without a tracker, or when this Redmine does not expose the project's issue custom fields, required fields cannot be scoped."
+      );
+    }
+
+    const appliesToTracker = (definition: RedmineCustomFieldDefinition) =>
+      (definition.trackers ?? []).some((candidate) => candidate.id === tracker.id);
+    for (const field of provided) {
+      const definition = definitions.find((candidate) => candidate.id === field.id);
+      if (definition && !appliesToTracker(definition)) {
+        throw new RedmineMcpError(
+          "VALIDATION_ERROR",
+          `Custom field "${field.name}" is not enabled for tracker "${tracker.name}"; Redmine would drop its value silently.`
+        );
+      }
+    }
+
+    const projectFieldIds = new Set(metadata.issue_custom_fields.map((field) => field.id));
+    const providedIds = new Set(provided.map((field) => field.id));
+    const missing = definitions
+      .filter(
+        (definition) =>
+          definition.is_required === true &&
+          projectFieldIds.has(definition.id) &&
+          appliesToTracker(definition) &&
+          !definition.default_value?.trim() &&
+          !providedIds.has(definition.id)
+      )
+      .map((definition) => ({ id: definition.id, name: definition.name.trim() }));
+
+    return { known: true, missing };
+  }
+
   public async updateIssueNote(input: {
     issue_id: number;
     journal_id: number;
@@ -947,6 +1214,150 @@ const CONTENT_TYPE_BY_EXTENSION: Record<string, string> = {
 
 function contentTypeForExtension(extension: string): string {
   return CONTENT_TYPE_BY_EXTENSION[extension.toLowerCase()] ?? "application/octet-stream";
+}
+
+function normalizeRelationType(relatedIssueId: number | undefined, relationType: string | undefined): string | undefined {
+  if (relatedIssueId === undefined) {
+    if (relationType?.trim()) {
+      throw new RedmineMcpError("VALIDATION_ERROR", "relation_type requires related_issue_id.");
+    }
+    return undefined;
+  }
+
+  const normalized = relationType?.trim().toLowerCase() || DEFAULT_RELATION_TYPE;
+  if (!(RELATION_TYPES as readonly string[]).includes(normalized)) {
+    throw new RedmineMcpError(
+      "VALIDATION_ERROR",
+      `Unknown relation_type "${relationType}". Use one of: ${RELATION_TYPES.join(", ")}.`
+    );
+  }
+  return normalized;
+}
+
+/** ID or name, case-insensitive: exact first, then a unique substring match; ambiguity is a VALIDATION_ERROR. */
+function matchNamedRef<T extends NamedRef>(ref: string, candidates: T[], label: string, scope: string): T {
+  const normalized = ref.trim().toLowerCase();
+  const nameOf = (candidate: T) => candidate.name.trim();
+  if (!normalized) {
+    throw new RedmineMcpError("VALIDATION_ERROR", `${label} must not be blank.`);
+  }
+
+  const exact = candidates.find(
+    (candidate) => String(candidate.id) === normalized || nameOf(candidate).toLowerCase() === normalized
+  );
+  if (exact) {
+    return exact;
+  }
+
+  // A numeric reference is an ID; matching it as part of a name would pick an unrelated entry.
+  const fuzzyMatches = /^\d+$/.test(normalized)
+    ? []
+    : candidates.filter((candidate) => nameOf(candidate).toLowerCase().includes(normalized));
+  if (fuzzyMatches.length === 1) {
+    return fuzzyMatches[0]!;
+  }
+  if (fuzzyMatches.length > 1) {
+    throw new RedmineMcpError(
+      "VALIDATION_ERROR",
+      `${label} "${ref}" is ambiguous in ${scope}: ${fuzzyMatches.map(nameOf).join(", ")}.`
+    );
+  }
+
+  throw new RedmineMcpError(
+    "NOT_FOUND",
+    `${label} "${ref}" was not found in ${scope}. Available: ${candidates.map(nameOf).join(", ")}.`
+  );
+}
+
+function resolveNewIssueCustomFields(
+  project: ProjectRef,
+  metadata: ProjectIssueMetadata,
+  input: Record<string, string | string[]>
+): CreateIssueCustomField[] {
+  const resolved: CreateIssueCustomField[] = [];
+
+  for (const [ref, value] of Object.entries(input)) {
+    let field: NamedRef;
+    if (metadata.issue_custom_fields) {
+      field = matchNamedRef(ref, metadata.issue_custom_fields, "Custom field", `project "${project.name}"`);
+    } else if (/^\d+$/.test(ref.trim())) {
+      field = { id: Number(ref.trim()), name: `#${ref.trim()}` };
+    } else {
+      throw new RedmineMcpError(
+        "VALIDATION_ERROR",
+        `Custom field "${ref}" cannot be resolved by name: this Redmine does not expose the project's issue custom fields. Pass the numeric ID instead.`
+      );
+    }
+
+    if (resolved.some((existing) => existing.id === field.id)) {
+      throw new RedmineMcpError(
+        "VALIDATION_ERROR",
+        `Custom field "${field.name.trim()}" is given more than once in custom_fields.`
+      );
+    }
+    resolved.push({ id: field.id, name: field.name.trim(), value });
+  }
+
+  // Object key order puts numeric keys first; sort so the preview does not depend on how fields were named.
+  return resolved.sort((left, right) => left.id - right.id);
+}
+
+function describePersistenceProblems(
+  issue: RedmineIssue,
+  expected: {
+    project: ProjectRef;
+    tracker: CreateIssueResult["tracker"];
+    priority: CreateIssueResult["priority"];
+    subject: string;
+    customFields: CreateIssueCustomField[];
+  }
+): { identity: string[]; details: string[] } {
+  const identity: string[] = [];
+  const details: string[] = [];
+  if (issue.project.id !== expected.project.id) {
+    identity.push(`project is "${issue.project.name}" instead of "${expected.project.name}"`);
+  }
+  if (expected.tracker && issue.tracker?.id !== expected.tracker.id) {
+    identity.push(
+      `tracker is "${issue.tracker?.name ?? "none"}" instead of "${expected.tracker.name}" (Redmine replaces a tracker your role may not use)`
+    );
+  }
+  if (issue.subject.trim() !== expected.subject) {
+    identity.push(`subject is "${issue.subject}" instead of "${expected.subject}"`);
+  }
+  if (expected.priority && issue.priority?.id !== expected.priority.id) {
+    details.push(`priority is "${issue.priority?.name ?? "none"}" instead of "${expected.priority.name}"`);
+  }
+  for (const field of expected.customFields) {
+    const actual = issue.custom_fields?.find((candidate) => candidate.id === field.id);
+    if (!sameCustomFieldValue(actual?.value ?? null, field.value)) {
+      const shown = actual ? JSON.stringify(actual.value) : "missing (not enabled for this tracker?)";
+      details.push(`custom field "${field.name}" is ${shown} instead of ${JSON.stringify(field.value)}`);
+    }
+  }
+  return { identity, details };
+}
+
+function sameCustomFieldValue(actual: string | string[] | null, expected: string | string[]): boolean {
+  // Redmine stores multi-values de-duplicated.
+  const normalize = (value: string | string[] | null) => [
+    ...new Set(
+      (Array.isArray(value) ? value : value === null ? [] : [value]).map((entry) => entry.trim()).filter(Boolean)
+    )
+  ].sort();
+  return JSON.stringify(normalize(actual)) === JSON.stringify(normalize(expected));
+}
+
+function hasRelationBetween(issue: RedmineIssue, otherIssueId: number): boolean {
+  return (issue.relations ?? []).some(
+    (relation) =>
+      (relation.issue_id === issue.id && relation.issue_to_id === otherIssueId) ||
+      (relation.issue_id === otherIssueId && relation.issue_to_id === issue.id)
+  );
+}
+
+function reasonOf(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).replace(/\.+$/, "");
 }
 
 function projectMatches(project: ProjectRef, projectRef: string): boolean {
