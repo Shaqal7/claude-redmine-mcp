@@ -595,7 +595,8 @@ describe("RedmineService.downloadAttachment", () => {
     await expect(stat(join(above, "dl"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it.skipIf(process.platform === "win32")("refuses a download folder reached through a link not owned by root, before creating it", async () => {
+  // As root (uid 0) the link the test creates belongs to root and is rightly accepted.
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("refuses a download folder reached through a link not owned by root, before creating it", async () => {
     // KB-26 N1: the user's own link could point through folders that are checked only after mkdir.
     const real = join(saveDir, "real");
     await mkdir(real);

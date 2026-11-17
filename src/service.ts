@@ -1610,7 +1610,7 @@ async function assertSafeAncestors(path: string, downloadDir: string, hint: stri
     const problem = info.isSymbolicLink()
       ? info.uid === 0
         ? null
-        : "is a link not owned by root"
+        : "is a link not owned by root (give the real path instead)"
       : !info.isDirectory()
         ? "is not a folder"
         : info.uid !== 0 && info.uid !== uid
