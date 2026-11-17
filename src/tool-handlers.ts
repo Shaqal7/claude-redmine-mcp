@@ -74,32 +74,40 @@ export function createToolHandlers(service: RedmineService) {
       relation_type?: string;
       attachments?: string[];
       dry_run?: boolean;
-    }): Promise<ToolResponse> => handleTool(async () => service.createIssue(input))
+    }): Promise<ToolResponse> => handleTool(async () => service.createIssue(input)),
+    downloadAttachment: async (input: {
+      issue_id: number;
+      attachment_id: number;
+      save_dir?: string;
+    }): Promise<ToolResponse> =>
+      handleToolContent(async () => {
+        const { image, ...summary } = await service.downloadAttachment(input);
+        const content: ToolResponse["content"] = [jsonText(summary)];
+        if (image) {
+          content.push({ type: "image", data: image.data, mimeType: image.mime_type });
+        }
+        return content;
+      })
   };
 }
 
 async function handleTool(fn: () => Promise<unknown>): Promise<ToolResponse> {
+  return handleToolContent(async () => [jsonText(await fn())]);
+}
+
+async function handleToolContent(fn: () => Promise<ToolResponse["content"]>): Promise<ToolResponse> {
   try {
-    const result = await fn();
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(result, null, 2)
-        }
-      ]
-    };
+    return { content: await fn() };
   } catch (error) {
     return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(formatError(error), null, 2)
-        }
-      ],
+      content: [jsonText(formatError(error))],
       isError: true
     };
   }
+}
+
+function jsonText(value: unknown): { type: "text"; text: string } {
+  return { type: "text", text: JSON.stringify(value, null, 2) };
 }
 
 function formatError(error: unknown): { code: ErrorCode | "UPSTREAM_ERROR"; message: string; details?: unknown } {

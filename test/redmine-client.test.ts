@@ -233,3 +233,134 @@ describe("RedmineClient", () => {
     });
   });
 });
+describe("RedmineClient.downloadAttachment", () => {
+  const downloadConfig: AppConfig = {
+    redmineBaseUrl: "https://redmine.example.com/redmine",
+    redmineApiKey: "secret-key-123",
+    allowedProjects: ["backend"],
+    defaultExternalProjects: ["backend"],
+    timeoutMs: 5_000
+  };
+  const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+
+  it("fetches content_url with the API key header, without following redirects", async () => {
+    const fetchMock = vi.fn(async () => new Response(pngBytes, { status: 200, headers: { "content-type": "image/png" } }));
+    const client = new RedmineClient(downloadConfig, fetchMock as typeof fetch);
+
+    const result = await client.downloadAttachment({
+      attachmentId: 7,
+      contentUrl: "https://redmine.example.com/redmine/attachments/download/7/shot.png",
+      maxBytes: 1_000
+    });
+
+    expect(Array.from(result.bytes)).toEqual(Array.from(pngBytes));
+    expect(result.contentType).toBe("image/png");
+    const [input, init] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
+    expect(String(input)).toBe("https://redmine.example.com/redmine/attachments/download/7/shot.png");
+    expect(String(input)).not.toContain("secret-key-123");
+    expect(init.headers).toMatchObject({ "X-Redmine-API-Key": "secret-key-123" });
+    expect(init.redirect).toBe("manual");
+  });
+
+  it.each([
+    ["another host", "https://evil.example.org/redmine/attachments/download/7/shot.png"],
+    ["plain http", "http://redmine.example.com/redmine/attachments/download/7/shot.png"],
+    ["a path outside the base path", "https://redmine.example.com/other/attachments/download/7/shot.png"],
+    ["a sibling path sharing the base path's prefix", "https://redmine.example.com/redmine-other/attachments/download/7/shot.png"],
+    ["a missing content_url", undefined]
+  ])("never sends the key to %s: downloads from the base URL instead", async (_label, contentUrl) => {
+    const fetchMock = vi.fn(async () => new Response(pngBytes, { status: 200 }));
+    const client = new RedmineClient(downloadConfig, fetchMock as typeof fetch);
+
+    await client.downloadAttachment({ attachmentId: 7, contentUrl, maxBytes: 1_000 });
+
+    const [input] = fetchMock.mock.calls[0] as unknown as [URL];
+    expect(String(input)).toBe("https://redmine.example.com/redmine/attachments/download/7");
+  });
+
+  it("rejects a Content-Length over the limit", async () => {
+    const fetchMock = vi.fn(
+      async () => new Response(pngBytes, { status: 200, headers: { "content-length": "20000000" } })
+    );
+    const client = new RedmineClient(downloadConfig, fetchMock as typeof fetch);
+
+    await expect(
+      client.downloadAttachment({ attachmentId: 7, maxBytes: 10 * 1024 * 1024 })
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("10 MB") });
+  });
+
+  it("stops reading a body that grows over the limit", async () => {
+    const chunks = Array.from({ length: 10 }, () => new Uint8Array(600));
+    let pulled = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const chunk = chunks[pulled++];
+        if (chunk) {
+          controller.enqueue(chunk);
+        } else {
+          controller.close();
+        }
+      }
+    });
+    const fetchMock = vi.fn(async () => new Response(body, { status: 200 }));
+    const client = new RedmineClient(downloadConfig, fetchMock as typeof fetch);
+
+    await expect(client.downloadAttachment({ attachmentId: 7, maxBytes: 1_000 })).rejects.toMatchObject({
+      code: "VALIDATION_ERROR"
+    });
+    // The stream may buffer one chunk ahead of the reader; the rest must stay unread.
+    expect(pulled).toBeLessThanOrEqual(4);
+  });
+
+  it("reports a redirect to the login page as AUTH_ERROR without the key", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(null, {
+          status: 302,
+          headers: { location: "https://redmine.example.com/redmine/login?back_url=x" }
+        })
+    );
+    const client = new RedmineClient(downloadConfig, fetchMock as typeof fetch);
+
+    const error = await client.downloadAttachment({ attachmentId: 7, maxBytes: 1_000 }).catch((caught) => caught);
+
+    expect(error).toMatchObject({ code: "AUTH_ERROR" });
+    expect(JSON.stringify({ message: error.message, details: error.details })).not.toContain("secret-key-123");
+  });
+
+  it("gives a download at least 60 s, body included, then times out", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn(
+        (_input: URL | RequestInfo, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+          })
+      );
+      const client = new RedmineClient(downloadConfig, fetchMock as typeof fetch);
+
+      const pending = client.downloadAttachment({ attachmentId: 7, maxBytes: 1_000 }).catch((caught) => caught);
+      await vi.advanceTimersByTimeAsync(downloadConfig.timeoutMs + 1);
+      let settled = false;
+      void pending.then(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await pending).toMatchObject({ code: "UPSTREAM_ERROR", message: "Redmine request timed out after 60000ms." });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("maps 404 to NOT_FOUND", async () => {
+    const fetchMock = vi.fn(async () => new Response("missing", { status: 404 }));
+    const client = new RedmineClient(downloadConfig, fetchMock as typeof fetch);
+
+    await expect(client.downloadAttachment({ attachmentId: 7, maxBytes: 1_000 })).rejects.toMatchObject({
+      code: "NOT_FOUND"
+    });
+  });
+});
