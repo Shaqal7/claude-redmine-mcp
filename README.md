@@ -81,7 +81,7 @@ docker mcp gateway run
 | `REDMINE_ALLOWED_PROJECTS`          | yes      | Comma-separated project **identifiers** (slugs) or numeric IDs — global allowlist enforced on every read                                                                              |
 | `REDMINE_DEFAULT_EXTERNAL_PROJECTS` | yes      | Comma-separated project identifiers used as defaults for `resolve_related_test_chain` when its `external_projects` arg is omitted. Every entry must also appear in the allowlist     |
 | `REDMINE_TIMEOUT_MS`                | no       | HTTP timeout in milliseconds (default: `15000`)                                                                                                                                      |
-| `REDMINE_DOWNLOAD_DIR`              | no       | Absolute path of the only folder `download_attachment` saves into (default: `<temp>/redmine-mcp-attachments`). Created if only it is missing; must be a private folder of the server's user. In Docker, point it at a mounted folder to see the files on the host |
+| `REDMINE_DOWNLOAD_DIR`              | no       | Absolute path of the only folder `download_attachment` saves into (default: `<temp>/redmine-mcp-attachments`). Created if only it is missing; must be a private folder of the server's user (on Linux/macOS also every folder above it: owned by that user or root, not writable by others unless sticky like `/tmp`). In Docker the files stay inside the container: a host-mounted folder usually belongs to another user or is writable by all, and is refused |
 
 **Finding the project identifier:** open the project in Redmine — the identifier is the last segment of the URL. For example, `https://redmine.example.com/redmine/projects/myproject` has identifier `myproject`.
 

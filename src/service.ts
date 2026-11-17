@@ -1,8 +1,8 @@
 import type { Stats } from "node:fs";
 import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
+import { defaultDownloadDir } from "./download-dir.js";
 import { RedmineMcpError } from "./errors.js";
 import { normalizeIssueDetail, normalizeIssueSummary } from "./redmine/normalize.js";
 import { ProjectPolicy } from "./redmine/policy.js";
@@ -1535,11 +1535,6 @@ function readWebpSize(bytes: Uint8Array, view: DataView): { width: number; heigh
   return null;
 }
 
-/** The download folder when REDMINE_DOWNLOAD_DIR is not set. */
-export function defaultDownloadDir(): string {
-  return join(tmpdir(), "redmine-mcp-attachments");
-}
-
 // One save_dir folder name: plain ASCII, no leading or trailing dot (Windows drops a trailing one), no ":" (drive or
 // NTFS stream), and no Windows device name.
 const SAVE_DIR_SEGMENT = /^[A-Za-z0-9_-](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?$/;
@@ -1552,9 +1547,9 @@ const WINDOWS_DEVICE_NAME = /^(con|prn|aux|nul|com\d|lpt\d)(\.|$)/i;
  *
  * Folders are created one level at a time (never `recursive`) and each is lstat-ed right after mkdir: a link, a
  * non-folder or, on POSIX, a folder of another user or writable by others is refused before anything is created
- * below it, so mkdir never follows a link. The download folder itself is created only when its parent exists; that
- * parent must not let other users rename entries (private, or sticky like /tmp), so once the download folder is
- * checked nobody else can swap it, or add or swap anything below it, before the write.
+ * below it, so mkdir never follows a link. The download folder itself is created only when its parent exists, and on
+ * POSIX nothing on the way to it may let other users rename or replace a folder (`assertSafeAncestors`), so once it
+ * is checked nobody else can swap it, or add or swap anything below it, before the write.
  */
 async function prepareSaveDirectory(downloadDir: string, saveDir: string | undefined): Promise<string> {
   try {
@@ -1578,6 +1573,7 @@ async function prepareDownloadFolder(downloadDir: string): Promise<string> {
   const hint = "set REDMINE_DOWNLOAD_DIR to a private folder";
   let checked: Stats;
   try {
+    await assertSafeAncestors(downloadDir, downloadDir, hint);
     checked = await makePrivateFolder(downloadDir, hint);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -1589,17 +1585,41 @@ async function prepareDownloadFolder(downloadDir: string): Promise<string> {
     throw error;
   }
   const root = await realpath(downloadDir);
-  const [resolved, parent] = await Promise.all([lstat(root), lstat(dirname(root))]);
+  const resolved = await lstat(root);
   if (resolved.dev !== checked.dev || resolved.ino !== checked.ino) {
     throw new RedmineMcpError("VALIDATION_ERROR", `The download folder "${downloadDir}" changed while it was checked.`);
   }
-  if (!isSafeParent(parent)) {
-    throw new RedmineMcpError(
-      "VALIDATION_ERROR",
-      `"${dirname(root)}" lets other users rename the download folder "${downloadDir}" in it; ${hint}.`
-    );
-  }
+  await assertSafeAncestors(root, downloadDir, hint);
   return root;
+}
+
+/**
+ * POSIX (OpenSSH's safe_path, plus links): nobody but this user and root can rename or replace anything on the way to
+ * `path`. Every folder above it belongs to one of them and is not writable by group or others, or is sticky (as /tmp
+ * is); every link above it belongs to one of them. Checked on the configured path before mkdir and on the real path
+ * after it. Windows: not checked (keep REDMINE_DOWNLOAD_DIR per-user, as TEMP is).
+ */
+async function assertSafeAncestors(path: string, downloadDir: string, hint: string): Promise<void> {
+  if (typeof process.getuid !== "function") {
+    return;
+  }
+  const uid = process.getuid();
+  for (let current = dirname(path); ; current = dirname(current)) {
+    const info = await lstat(current);
+    const owned = info.uid === 0 || info.uid === uid;
+    const safe = info.isSymbolicLink()
+      ? owned
+      : info.isDirectory() && owned && ((info.mode & 0o022) === 0 || (info.mode & 0o1000) !== 0);
+    if (!safe) {
+      throw new RedmineMcpError(
+        "VALIDATION_ERROR",
+        `"${current}" lets other users rename or replace folders on the way to the download folder "${downloadDir}"; ${hint}.`
+      );
+    }
+    if (dirname(current) === current) {
+      return;
+    }
+  }
 }
 
 /**
@@ -1610,9 +1630,8 @@ function saveDirSegments(downloadDir: string, root: string, saveDir: string | un
   if (saveDir === undefined) {
     return [];
   }
-  const relativePath = isAbsolute(saveDir)
-    ? (pathInside(downloadDir, resolve(saveDir)) ?? pathInside(root, resolve(saveDir)))
-    : pathInside(downloadDir, resolve(downloadDir, saveDir));
+  const target = resolve(downloadDir, saveDir);
+  const relativePath = pathInside(downloadDir, target) ?? pathInside(root, target);
   if (relativePath === null) {
     throw new RedmineMcpError(
       "VALIDATION_ERROR",
@@ -1663,18 +1682,6 @@ async function makePrivateFolder(path: string, hint: string): Promise<Stats> {
 /** POSIX: owned by this user and not writable by group or others. A Windows temp dir is per-user. */
 function isPrivateToUser(info: Stats): boolean {
   return typeof process.getuid !== "function" || (info.uid === process.getuid() && (info.mode & 0o022) === 0);
-}
-
-/**
- * POSIX: only this user or root can rename entries in this folder: it belongs to one of them and is either not
- * writable by group or others or sticky (as /tmp is). Windows: not checked (keep REDMINE_DOWNLOAD_DIR per-user).
- */
-function isSafeParent(info: Stats): boolean {
-  if (typeof process.getuid !== "function") {
-    return true;
-  }
-  const owner = info.uid === 0 || info.uid === process.getuid();
-  return owner && ((info.mode & 0o022) === 0 || (info.mode & 0o1000) !== 0);
 }
 
 /**

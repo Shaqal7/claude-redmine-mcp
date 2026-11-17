@@ -578,6 +578,34 @@ describe("RedmineService.downloadAttachment", () => {
     expect(await readdir(saveDir)).toEqual([]);
   });
 
+  it.skipIf(process.platform === "win32").each([
+    ["its parent", ["shared"]],
+    ["a folder further up", ["shared", "team"]]
+  ])("refuses a download folder when %s lets other users rename folders, before creating it", async (_label, path) => {
+    // KB-26 R1: another user could swap a folder on the way (e.g. REDMINE_DOWNLOAD_DIR=/srv/team/alice/dl).
+    const above = join(saveDir, ...path);
+    await mkdir(above, { recursive: true });
+    await chmod(join(saveDir, "shared"), 0o777);
+    const { service } = textFile(24, "a.txt", "x", join(above, "dl"));
+
+    await expect(service.downloadAttachment({ issue_id: 295390, attachment_id: 24 })).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+      message: expect.stringContaining("other users")
+    });
+    await expect(stat(join(above, "dl"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.skipIf(process.platform === "win32")("accepts a download folder in a sticky folder others can write to, as /tmp", async () => {
+    const sticky = join(saveDir, "sticky");
+    await mkdir(sticky);
+    await chmod(sticky, 0o1777);
+    const { service } = textFile(25, "a.txt", "x", join(sticky, "dl"));
+
+    const result = await service.downloadAttachment({ issue_id: 295390, attachment_id: 25 });
+
+    expect(result.saved_to).toBe(join(realSaveDir, "sticky", "dl", "25-a.txt"));
+  });
+
   it.skipIf(process.platform === "win32")("refuses a directory that other users can write to", async () => {
     const shared = join(saveDir, "shared");
     await mkdir(shared);

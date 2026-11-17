@@ -3,7 +3,7 @@ import "dotenv/config";
 import { isAbsolute, resolve } from "node:path";
 
 import { RedmineMcpError } from "./errors.js";
-import { defaultDownloadDir } from "./service.js";
+import { defaultDownloadDir } from "./download-dir.js";
 import type { AppConfig } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
