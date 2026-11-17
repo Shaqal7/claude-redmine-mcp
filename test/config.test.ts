@@ -1,3 +1,6 @@
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { loadConfig } from "../src/config.js";
@@ -47,5 +50,31 @@ describe("loadConfig", () => {
         REDMINE_API_KEY: "secret"
       })
     ).toThrowError(RedmineMcpError);
+  });
+
+  const baseEnv = {
+    REDMINE_BASE_URL: "https://redmine.example.com",
+    REDMINE_API_KEY: "secret",
+    REDMINE_ALLOWED_PROJECTS: "backend",
+    REDMINE_DEFAULT_EXTERNAL_PROJECTS: "backend"
+  };
+
+  it("defaults the download folder to <temp>/redmine-mcp-attachments", () => {
+    expect(loadConfig(baseEnv).downloadDir).toBe(join(tmpdir(), "redmine-mcp-attachments"));
+    expect(loadConfig({ ...baseEnv, REDMINE_DOWNLOAD_DIR: "  " }).downloadDir).toBe(
+      join(tmpdir(), "redmine-mcp-attachments")
+    );
+  });
+
+  it("takes an absolute REDMINE_DOWNLOAD_DIR, normalized", () => {
+    const folder = join(tmpdir(), "elsewhere", "..", "redmine-downloads");
+
+    expect(loadConfig({ ...baseEnv, REDMINE_DOWNLOAD_DIR: ` ${folder} ` }).downloadDir).toBe(
+      resolve(tmpdir(), "redmine-downloads")
+    );
+  });
+
+  it("rejects a relative REDMINE_DOWNLOAD_DIR", () => {
+    expect(() => loadConfig({ ...baseEnv, REDMINE_DOWNLOAD_DIR: "~/redmine" })).toThrowError(/REDMINE_DOWNLOAD_DIR/);
   });
 });

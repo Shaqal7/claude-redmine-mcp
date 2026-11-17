@@ -58,7 +58,6 @@ const MAX_INLINE_IMAGE_BYTES = 3_750_000;
 const MAX_IMAGE_SIDE_PX = 8000;
 // UTF-8 bytes of a saved file name: below the 255 a path segment may have on NTFS and ext4.
 const MAX_SAVED_NAME_BYTES = 200;
-const DEFAULT_ATTACHMENT_DIR_NAME = "redmine-mcp-attachments";
 const INLINE_IMAGE_TYPES: ReadonlySet<string> = new Set<InlineImageType>([
   "image/png",
   "image/jpeg",
@@ -70,12 +69,14 @@ export class RedmineService {
   private readonly policy: ProjectPolicy;
   private readonly defaultExternalProjects: string[];
   private readonly readFileImpl: FileReader;
+  private readonly downloadDir: string;
 
   public constructor(
     private readonly client: RedmineClient,
     allowedProjects: string[],
     defaultExternalProjects: string[],
-    readFileImpl: FileReader = (filePath) => readFile(filePath).then((buffer) => new Uint8Array(buffer))
+    readFileImpl: FileReader = (filePath) => readFile(filePath).then((buffer) => new Uint8Array(buffer)),
+    downloadDir: string = defaultDownloadDir()
   ) {
     if (!defaultExternalProjects || defaultExternalProjects.length === 0) {
       throw new RedmineMcpError(
@@ -86,6 +87,7 @@ export class RedmineService {
     this.policy = new ProjectPolicy(allowedProjects);
     this.defaultExternalProjects = defaultExternalProjects;
     this.readFileImpl = readFileImpl;
+    this.downloadDir = resolve(downloadDir);
   }
 
   public async listIssues(input: {
@@ -543,7 +545,7 @@ export class RedmineService {
     bytes: Uint8Array,
     saveDir: string | undefined
   ): Promise<string> {
-    const directory = await prepareSaveDirectory(saveDir);
+    const directory = await prepareSaveDirectory(this.downloadDir, saveDir);
     const target = join(directory, localAttachmentFilename(meta.id, meta.filename));
 
     try {
@@ -1467,6 +1469,9 @@ function readJpegSize(bytes: Uint8Array, view: DataView): { width: number; heigh
   let size: { width: number; height: number } | null = null;
   let offset = 2;
   while (offset + 2 <= length) {
+    // Stray bytes before a marker are not skipped (KB-26 P2): libjpeg calls them corrupt data, and resyncing on the
+    // next FF after a wrong segment length could reach the FF D9 of an embedded EXIF thumbnail and pass a truncated
+    // file as complete. Such a file is saved instead, which is safe.
     if (view.getUint8(offset) !== 0xff) {
       return null;
     }
@@ -1530,98 +1535,146 @@ function readWebpSize(bytes: Uint8Array, view: DataView): { width: number; heigh
   return null;
 }
 
-/**
- * The verified real path of the folder to save into (default: <temp>/redmine-mcp-attachments). The name and the
- * bytes come from Redmine users and save_dir from the model, so the folder must be inside the system temp directory:
- * no `..`, junction or symlink out of it (e.g. to a Startup folder). Every folder below the temp root must be a real
- * folder that, on POSIX, belongs to this user and nobody else can write to. That is checked for the existing folders
- * before mkdir (nobody else can put a link where a missing folder is to be created) and for all of them after it
- * (nobody else can swap one for a link before the write).
- */
-async function prepareSaveDirectory(saveDir: string | undefined): Promise<string> {
-  const root = await realpath(tmpdir());
-  if (saveDir !== undefined && !isAbsolute(saveDir)) {
-    throw new RedmineMcpError(
-      "VALIDATION_ERROR",
-      `save_dir "${saveDir}" must be an absolute path to a folder inside the system temp directory (${root}); "~" is not expanded.`
-    );
-  }
-  const requested = saveDir === undefined ? join(root, DEFAULT_ATTACHMENT_DIR_NAME) : resolve(saveDir);
-  const outside = () =>
-    new RedmineMcpError(
-      "VALIDATION_ERROR",
-      `save_dir "${requested}" is not a folder inside the system temp directory (${root}); attachments are saved only there.`
-    );
+/** The download folder when REDMINE_DOWNLOAD_DIR is not set. */
+export function defaultDownloadDir(): string {
+  return join(tmpdir(), "redmine-mcp-attachments");
+}
 
+// One save_dir folder name: plain ASCII, no leading or trailing dot (Windows drops a trailing one), no ":" (drive or
+// NTFS stream), and no Windows device name.
+const SAVE_DIR_SEGMENT = /^[A-Za-z0-9_-](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?$/;
+const WINDOWS_DEVICE_NAME = /^(con|prn|aux|nul|com\d|lpt\d)(\.|$)/i;
+
+/**
+ * The folder to save into: the download folder (REDMINE_DOWNLOAD_DIR, default <temp>/redmine-mcp-attachments) or
+ * save_dir inside it. The name and the bytes come from Redmine users and save_dir from the model, so nothing is saved
+ * anywhere else, e.g. into a venv or another program's folder elsewhere in temp.
+ *
+ * Folders are created one level at a time (never `recursive`) and each is lstat-ed right after mkdir: a link, a
+ * non-folder or, on POSIX, a folder of another user or writable by others is refused before anything is created
+ * below it, so mkdir never follows a link. The download folder itself is created only when its parent exists; that
+ * parent must not let other users rename entries (private, or sticky like /tmp), so once the download folder is
+ * checked nobody else can swap it, or add or swap anything below it, before the write.
+ */
+async function prepareSaveDirectory(downloadDir: string, saveDir: string | undefined): Promise<string> {
   try {
-    const { existing, missing } = await nearestExistingFolder(requested);
-    if (pathBelow(root, join(existing, ...missing)) === null) {
-      throw outside();
+    const root = await prepareDownloadFolder(downloadDir);
+    let directory = root;
+    for (const segment of saveDirSegments(downloadDir, root, saveDir)) {
+      directory = join(directory, segment);
+      await makePrivateFolder(directory, "pass another save_dir");
     }
-    await assertPrivateFolders(root, existing);
-    await mkdir(requested, { recursive: true, mode: 0o700 });
-    const directory = await realpath(requested);
-    if (pathBelow(root, directory) === null) {
-      throw outside();
-    }
-    await assertPrivateFolders(root, directory);
     return directory;
   } catch (error) {
     if (error instanceof RedmineMcpError) {
       throw error;
     }
-    throw new RedmineMcpError("VALIDATION_ERROR", `Unable to prepare save_dir "${requested}": ${reasonOf(error)}.`);
+    throw new RedmineMcpError("VALIDATION_ERROR", `Unable to prepare the folder to save into: ${reasonOf(error)}.`);
   }
 }
 
-/** The path of `realPath` relative to `root` when it lies strictly below it, else null. */
-function pathBelow(root: string, realPath: string): string | null {
-  const relativePath = relative(root, realPath);
-  const below =
-    relativePath !== "" && relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath);
-  return below ? relativePath : null;
-}
-
-/** Every folder from below `root` down to `realPath` (which is `root` or below it) must be private to this user. */
-async function assertPrivateFolders(root: string, realPath: string): Promise<void> {
-  const relativePath = pathBelow(root, realPath);
-  if (relativePath === null) {
-    return;
-  }
-  let current = root;
-  for (const segment of relativePath.split(sep)) {
-    current = join(current, segment);
-    const info = await lstat(current);
-    if (info.isSymbolicLink() || !info.isDirectory() || !isPrivateToUser(info)) {
+/** The real path of the checked download folder, created when only it is missing. */
+async function prepareDownloadFolder(downloadDir: string): Promise<string> {
+  const hint = "set REDMINE_DOWNLOAD_DIR to a private folder";
+  let checked: Stats;
+  try {
+    checked = await makePrivateFolder(downloadDir, hint);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       throw new RedmineMcpError(
         "VALIDATION_ERROR",
-        `"${current}" is a link, belongs to another user or is writable by others; pass a private save_dir.`
+        `The download folder "${downloadDir}" cannot be created because its parent folder does not exist; create it or ${hint}.`
       );
     }
+    throw error;
   }
+  const root = await realpath(downloadDir);
+  const [resolved, parent] = await Promise.all([lstat(root), lstat(dirname(root))]);
+  if (resolved.dev !== checked.dev || resolved.ino !== checked.ino) {
+    throw new RedmineMcpError("VALIDATION_ERROR", `The download folder "${downloadDir}" changed while it was checked.`);
+  }
+  if (!isSafeParent(parent)) {
+    throw new RedmineMcpError(
+      "VALIDATION_ERROR",
+      `"${dirname(root)}" lets other users rename the download folder "${downloadDir}" in it; ${hint}.`
+    );
+  }
+  return root;
 }
 
-/** realpath of the nearest existing ancestor (junctions and symlinks resolved) and the missing segments below it. */
-async function nearestExistingFolder(path: string): Promise<{ existing: string; missing: string[] }> {
-  const missing: string[] = [];
-  let current = path;
-  for (;;) {
-    try {
-      return { existing: await realpath(current), missing };
-    } catch (error) {
-      const parent = dirname(current);
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || parent === current) {
-        throw error;
-      }
-      missing.unshift(basename(current));
-      current = parent;
+/**
+ * save_dir as folder names below the download folder ([] for the folder itself). A relative save_dir is taken from the
+ * download folder; an absolute one must lie inside it, as configured or as its real path (the one saved_to shows).
+ */
+function saveDirSegments(downloadDir: string, root: string, saveDir: string | undefined): string[] {
+  if (saveDir === undefined) {
+    return [];
+  }
+  const relativePath = isAbsolute(saveDir)
+    ? (pathInside(downloadDir, resolve(saveDir)) ?? pathInside(root, resolve(saveDir)))
+    : pathInside(downloadDir, resolve(downloadDir, saveDir));
+  if (relativePath === null) {
+    throw new RedmineMcpError(
+      "VALIDATION_ERROR",
+      `save_dir "${saveDir}" is not inside the download folder (${root}); pass a subfolder name such as "295390" or "qa/295390", or an absolute path inside that folder.`
+    );
+  }
+  const segments = relativePath === "" ? [] : relativePath.split(sep);
+  const invalid = segments.find((segment) => !SAVE_DIR_SEGMENT.test(segment) || WINDOWS_DEVICE_NAME.test(segment));
+  if (invalid !== undefined) {
+    throw new RedmineMcpError(
+      "VALIDATION_ERROR",
+      `save_dir "${saveDir}" has the folder name "${invalid}"; use letters, digits, "_", "-" and inner ".", "/" between subfolders, and no Windows device names (CON, NUL, COM1…).`
+    );
+  }
+  return segments;
+}
+
+/** The path of `path` relative to `base` when it is `base` ("") or lies below it, else null. */
+function pathInside(base: string, path: string): string | null {
+  const relativePath = relative(base, path);
+  const outside = relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath);
+  return outside ? null : relativePath;
+}
+
+/** mkdir one level (0700) unless the entry exists, then lstat it: a real folder that is private to this user. */
+async function makePrivateFolder(path: string, hint: string): Promise<Stats> {
+  try {
+    await mkdir(path, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+      throw error;
     }
   }
+  const info = await lstat(path);
+  const problem = info.isSymbolicLink()
+    ? "is a link (junction or symlink)"
+    : !info.isDirectory()
+      ? "is not a folder"
+      : !isPrivateToUser(info)
+        ? "belongs to another user or is writable by others"
+        : null;
+  if (problem !== null) {
+    throw new RedmineMcpError("VALIDATION_ERROR", `"${path}" ${problem}; ${hint}.`);
+  }
+  return info;
 }
 
 /** POSIX: owned by this user and not writable by group or others. A Windows temp dir is per-user. */
 function isPrivateToUser(info: Stats): boolean {
   return typeof process.getuid !== "function" || (info.uid === process.getuid() && (info.mode & 0o022) === 0);
+}
+
+/**
+ * POSIX: only this user or root can rename entries in this folder: it belongs to one of them and is either not
+ * writable by group or others or sticky (as /tmp is). Windows: not checked (keep REDMINE_DOWNLOAD_DIR per-user).
+ */
+function isSafeParent(info: Stats): boolean {
+  if (typeof process.getuid !== "function") {
+    return true;
+  }
+  const owner = info.uid === 0 || info.uid === process.getuid();
+  return owner && ((info.mode & 0o022) === 0 || (info.mode & 0o1000) !== 0);
 }
 
 /**

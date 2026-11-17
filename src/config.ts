@@ -1,6 +1,9 @@
 import "dotenv/config";
 
+import { isAbsolute, resolve } from "node:path";
+
 import { RedmineMcpError } from "./errors.js";
+import { defaultDownloadDir } from "./service.js";
 import type { AppConfig } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -15,6 +18,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     .map((value) => value.trim())
     .filter(Boolean);
   const timeoutMs = Number.parseInt(env.REDMINE_TIMEOUT_MS ?? "", 10);
+  const downloadDir = env.REDMINE_DOWNLOAD_DIR?.trim();
 
   if (!redmineBaseUrl) {
     throw new RedmineMcpError(
@@ -55,11 +59,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     );
   }
 
+  if (downloadDir && !isAbsolute(downloadDir)) {
+    throw new RedmineMcpError(
+      "VALIDATION_ERROR",
+      `REDMINE_DOWNLOAD_DIR "${downloadDir}" must be an absolute path ("~" is not expanded).`
+    );
+  }
+
   return {
     redmineBaseUrl: redmineBaseUrl.replace(/\/+$/, ""),
     redmineApiKey,
     allowedProjects,
     defaultExternalProjects,
-    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS
+    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS,
+    downloadDir: downloadDir ? resolve(downloadDir) : defaultDownloadDir()
   };
 }

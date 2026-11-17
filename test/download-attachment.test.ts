@@ -93,6 +93,12 @@ function jpegWithScan(trailing = 0): Uint8Array {
   ]);
 }
 
+/** jpegWithScan with two zero bytes between the frame header (SOF) and the scan header (SOS). */
+function withStrayBytesAfterSof(): Uint8Array {
+  const bytes = jpegWithScan();
+  return new Uint8Array([...bytes.subarray(0, 23), 0x00, 0x00, ...bytes.subarray(23)]);
+}
+
 /** Same length, last byte changed: the end marker is gone but every length guard still passes. */
 function withDamagedEnd(bytes: Uint8Array): Uint8Array {
   const copy = new Uint8Array(bytes);
@@ -130,33 +136,51 @@ function issueWith(attachments: RedmineAttachment[], project: ProjectRef = rossm
   };
 }
 
-function setup(issue: RedmineIssue, download: { bytes: Uint8Array; contentType?: string | null }) {
+/** The download folder (REDMINE_DOWNLOAD_DIR) of services built by `setup`; null = the server's default. */
+let testDownloadDir: string | null = null;
+
+function setup(
+  issue: RedmineIssue,
+  download: { bytes: Uint8Array; contentType?: string | null },
+  downloadDir: string | null = testDownloadDir
+) {
   const client = {
     getBaseUrl: () => "https://redmine.example.com/redmine",
     getIssue: vi.fn(async () => issue),
     getProject: vi.fn(async (projectRef: string) => (projectRef === "9" ? kasaProject : rossmannProject)),
     downloadAttachment: vi.fn(async () => ({ bytes: download.bytes, contentType: download.contentType ?? null }))
   };
-  const service = new RedmineService(client as never, ["rossmannmerge"], ["rossmannmerge"]);
+  const service = new RedmineService(
+    client as never,
+    ["rossmannmerge"],
+    ["rossmannmerge"],
+    undefined,
+    downloadDir ?? undefined
+  );
   return { client, service };
 }
 
-function textFile(id: number, filename: string, text = "x") {
-  return setup(issueWith([attachment({ id, filename, content_type: "text/plain" })]), {
-    bytes: new TextEncoder().encode(text)
-  });
+function textFile(id: number, filename: string, text = "x", downloadDir: string | null = testDownloadDir) {
+  return setup(
+    issueWith([attachment({ id, filename, content_type: "text/plain" })]),
+    { bytes: new TextEncoder().encode(text) },
+    downloadDir
+  );
 }
 
 describe("RedmineService.downloadAttachment", () => {
   let saveDir: string;
   let realSaveDir: string;
 
+  // saveDir is the download folder of every service built in a test, unless the test passes another one.
   beforeEach(async () => {
     saveDir = await mkdtemp(join(tmpdir(), "redmine-mcp-download-test-"));
     realSaveDir = await realpath(saveDir);
+    testDownloadDir = saveDir;
   });
 
   afterEach(async () => {
+    testDownloadDir = null;
     await rm(saveDir, { recursive: true, force: true });
   });
 
@@ -245,6 +269,8 @@ describe("RedmineService.downloadAttachment", () => {
     ["a JPEG wider than 8000 px", jpeg(8001, 10), /8001×10 px/],
     ["a JPEG without its end marker", jpeg().subarray(0, 39), /truncated or damaged/],
     ["a JPEG cut inside its scan data", jpegWithScan().subarray(0, 42), /truncated or damaged/],
+    // KB-26 P2, kept strict on purpose: libjpeg calls this "corrupt JPEG data: extraneous bytes before marker".
+    ["a JPEG with stray bytes between segments", withStrayBytesAfterSof(), /truncated or damaged/],
     ["a GIF without its trailer", gif().subarray(0, 13), /truncated or damaged/],
     ["a GIF whose trailer is damaged", withDamagedEnd(gif()), /truncated or damaged/],
     ["a WebP shorter than its RIFF size", webp().subarray(0, 26), /truncated or damaged/],
@@ -293,11 +319,12 @@ describe("RedmineService.downloadAttachment", () => {
     expect(JSON.stringify(result)).not.toContain("line 1");
   });
 
-  it("saves a non-image file under the system temp directory by default", async () => {
+  it("saves a non-image file under <temp>/redmine-mcp-attachments by default", async () => {
     const zip = new Uint8Array([0x50, 0x4b, 3, 4, 1, 2]);
     const { service } = setup(
       issueWith([attachment({ id: 987654321, filename: "dump.zip", content_type: "application/zip" })]),
-      { bytes: zip }
+      { bytes: zip },
+      null
     );
 
     const result = await service.downloadAttachment({ issue_id: 295390, attachment_id: 987654321 });
@@ -403,13 +430,42 @@ describe("RedmineService.downloadAttachment", () => {
     expect(await readdir(saveDir)).toEqual([name]);
   });
 
-  it("refuses a save_dir outside the system temp directory and creates nothing", async () => {
+  it.each([
+    ["a relative name", "qa", ["qa"]],
+    ["relative subfolders", "qa/295390", ["qa", "295390"]],
+    ["an absolute path inside the download folder", "<root>/qa/295390", ["qa", "295390"]]
+  ])("saves into a save_dir inside the download folder (%s)", async (_label, given, segments) => {
+    const { service } = textFile(19, "a.txt");
+    const save_dir = given.replace("<root>", saveDir);
+
+    const result = await service.downloadAttachment({ issue_id: 295390, attachment_id: 19, save_dir });
+
+    expect(result.saved_to).toBe(join(realSaveDir, ...segments, "19-a.txt"));
+    expect(await readFile(result.saved_to as string, "utf8")).toBe("x");
+  });
+
+  it("refuses a save_dir outside the download folder, even inside temp, and writes nothing there", async () => {
+    // e.g. a Python venv under temp, where a planted <id>-x.pth would run at interpreter start.
+    const venv = await mkdtemp(join(tmpdir(), "kb26-venv-"));
+    const { service } = textFile(10, "x.pth");
+
+    try {
+      await expect(
+        service.downloadAttachment({ issue_id: 295390, attachment_id: 10, save_dir: join(venv, "site-packages") })
+      ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("download folder") });
+      expect(await readdir(venv)).toEqual([]);
+    } finally {
+      await rm(venv, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a save_dir that climbs out of the download folder and creates nothing", async () => {
     const outside = resolve(tmpdir(), "..", `kb24-outside-${process.pid}-${Date.now()}`);
     const { service } = textFile(10, "a.bat");
 
     await expect(
       service.downloadAttachment({ issue_id: 295390, attachment_id: 10, save_dir: join(saveDir, "..", "..", basename(outside)) })
-    ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("temp directory") });
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("download folder") });
     await expect(stat(outside)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -418,18 +474,28 @@ describe("RedmineService.downloadAttachment", () => {
 
     await expect(
       service.downloadAttachment({ issue_id: 295390, attachment_id: 16, save_dir: tmpdir() })
-    ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("temp directory") });
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("download folder") });
   });
 
-  it("refuses a relative save_dir", async () => {
+  it.each([
+    ["a home-relative path", "~/Downloads"],
+    ["a parent reference", ".."],
+    ["a climb out through a subfolder", "qa/../../elsewhere"],
+    ["a name with a space", "qa 1"],
+    ["a name with a colon (drive or NTFS stream)", "qa:stream"],
+    ["a Windows device name", "CON"],
+    ["a Windows device name with an extension", "qa/nul.txt"],
+    ["a name ending in a dot", "qa."]
+  ])("refuses %s as save_dir and creates nothing", async (_label, given) => {
     const { service } = textFile(17, "a.txt");
 
     await expect(
-      service.downloadAttachment({ issue_id: 295390, attachment_id: 17, save_dir: "~/Downloads" })
-    ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("absolute") });
+      service.downloadAttachment({ issue_id: 295390, attachment_id: 17, save_dir: given })
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    expect(await readdir(saveDir)).toEqual([]);
   });
 
-  it("refuses a save_dir that leaves the temp directory through a junction or symlink", async () => {
+  it("refuses a save_dir that leaves through a junction or symlink, before creating anything", async () => {
     const { service } = textFile(11, "a.bat");
     let target: string | undefined;
 
@@ -440,13 +506,76 @@ describe("RedmineService.downloadAttachment", () => {
       await symlink(target, link, "junction");
       await expect(
         service.downloadAttachment({ issue_id: 295390, attachment_id: 11, save_dir: join(link, "sub") })
-      ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("temp directory") });
+      ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("is a link") });
       expect(await readdir(target)).toEqual([]);
     } finally {
       if (target) {
         await rm(target, { recursive: true, force: true });
       }
     }
+  });
+
+  it.each([
+    ["through the link", (link: string) => join(link, "new")],
+    ["the link itself", (link: string) => link],
+    ["the link by a relative name", () => "link/new"]
+  ])("refuses a link inside the download folder even to a folder in temp (%s)", async (_label, saveDirFor) => {
+    // P1 (KB-26): mkdir must never follow a link that the walk has not checked.
+    const target = await mkdtemp(join(tmpdir(), "kb26-link-target-"));
+    const { service } = textFile(20, "a.txt");
+
+    try {
+      const link = join(saveDir, "link");
+      await symlink(target, link, "junction");
+      await expect(
+        service.downloadAttachment({ issue_id: 295390, attachment_id: 20, save_dir: saveDirFor(link) })
+      ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("is a link") });
+      expect(await readdir(target)).toEqual([]);
+    } finally {
+      await rm(target, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a download folder that is a link and writes nothing through it", async () => {
+    // P1 (KB-26): on a shared /tmp another user can create <temp>/redmine-mcp-attachments as a link first.
+    const target = await mkdtemp(join(tmpdir(), "kb26-root-target-"));
+    const root = join(saveDir, "downloads");
+    const { service } = textFile(21, "a.txt", "x", root);
+
+    try {
+      await symlink(target, root, "junction");
+      await expect(service.downloadAttachment({ issue_id: 295390, attachment_id: 21 })).rejects.toMatchObject({
+        code: "VALIDATION_ERROR",
+        message: expect.stringContaining("is a link")
+      });
+      expect(await readdir(target)).toEqual([]);
+    } finally {
+      await rm(target, { recursive: true, force: true });
+    }
+  });
+
+  it("creates a missing download folder, but not its missing parents", async () => {
+    const created = textFile(22, "a.txt", "x", join(saveDir, "downloads"));
+    const result = await created.service.downloadAttachment({ issue_id: 295390, attachment_id: 22 });
+    expect(result.saved_to).toBe(join(realSaveDir, "downloads", "22-a.txt"));
+
+    const orphan = textFile(22, "a.txt", "x", join(saveDir, "missing", "downloads"));
+    await expect(orphan.service.downloadAttachment({ issue_id: 295390, attachment_id: 22 })).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+      message: expect.stringContaining("REDMINE_DOWNLOAD_DIR")
+    });
+    await expect(stat(join(saveDir, "missing"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.skipIf(process.platform === "win32")("refuses a download folder that other users can write to", async () => {
+    await chmod(saveDir, 0o777);
+    const { service } = textFile(23, "a.txt");
+
+    await expect(service.downloadAttachment({ issue_id: 295390, attachment_id: 23 })).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+      message: expect.stringContaining("writable by others")
+    });
+    expect(await readdir(saveDir)).toEqual([]);
   });
 
   it.skipIf(process.platform === "win32")("refuses a directory that other users can write to", async () => {
@@ -462,16 +591,16 @@ describe("RedmineService.downloadAttachment", () => {
     expect(await readdir(shared)).toEqual([]);
   });
 
-  it.skipIf(process.platform === "win32")("creates the directory and the file private to the user", async () => {
-    const { service } = textFile(13, "a.txt");
+  it.skipIf(process.platform === "win32")("creates the folders and the file private to the user", async () => {
+    const root = join(saveDir, "downloads");
+    const { service } = textFile(13, "a.txt", "x", root);
 
-    const result = await service.downloadAttachment({
-      issue_id: 295390,
-      attachment_id: 13,
-      save_dir: join(saveDir, "fresh")
-    });
+    const result = await service.downloadAttachment({ issue_id: 295390, attachment_id: 13, save_dir: "fresh/inner" });
 
-    expect((await stat(join(saveDir, "fresh"))).mode & 0o777).toBe(0o700);
+    expect(result.saved_to).toBe(join(realSaveDir, "downloads", "fresh", "inner", "13-a.txt"));
+    expect((await stat(root)).mode & 0o777).toBe(0o700);
+    expect((await stat(join(root, "fresh"))).mode & 0o777).toBe(0o700);
+    expect((await stat(join(root, "fresh", "inner"))).mode & 0o777).toBe(0o700);
     expect((await stat(result.saved_to as string)).mode & 0o777).toBe(0o600);
   });
 

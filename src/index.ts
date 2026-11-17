@@ -11,7 +11,13 @@ import { createToolHandlers } from "./tool-handlers.js";
 
 const config = loadConfig();
 const client = new RedmineClient(config);
-const service = new RedmineService(client, config.allowedProjects, config.defaultExternalProjects);
+const service = new RedmineService(
+  client,
+  config.allowedProjects,
+  config.defaultExternalProjects,
+  undefined,
+  config.downloadDir
+);
 const handlers = createToolHandlers(service);
 
 const server = new McpServer({
@@ -54,7 +60,7 @@ server.registerTool("get_issue", {
 
 server.registerTool("download_attachment", {
   description:
-    "Download one attachment of an issue in an allowed Redmine project so you can look at it (read-only: nothing is written to Redmine). Get attachment_id from get_issue; the attachment must belong to issue_id. A PNG, JPEG, GIF or WebP image up to 3.75 MB and 8000 px per side, with an intact header and end marker, comes back as an image you see directly, with its name, size, author and date (it is also saved when save_dir is given). Any other file, or an image that fails those checks (the result's note says why), is saved as <attachment_id>-<filename> (a very long name is shortened) and only its path is returned: open it with your file tools. save_dir must be an absolute path to a folder inside the system temp directory of the MCP server's machine (default: <temp>/redmine-mcp-attachments); anything else is refused. An existing file with different content is never overwritten. Attachments over 10 MB are refused.",
+    "Download one attachment of an issue in an allowed Redmine project so you can look at it (read-only: nothing is written to Redmine). Get attachment_id from get_issue; the attachment must belong to issue_id. A PNG, JPEG, GIF or WebP image up to 3.75 MB and 8000 px per side, with an intact header and end marker, comes back as an image you see directly, with its name, size, author and date (it is also saved when save_dir is given). Any other file, or an image that fails those checks (the result's note says why), is saved as <attachment_id>-<filename> (a very long name is shortened) and only its path is returned: open it with your file tools. Files are saved only in the server's download folder (REDMINE_DOWNLOAD_DIR on the MCP server's machine, default <temp>/redmine-mcp-attachments; saved_to shows its path). save_dir picks a subfolder of it: a relative name such as \"295390\" or \"qa/295390\" (letters, digits, '_', '-', inner '.'), or an absolute path inside that folder; anything else is refused. An existing file with different content is never overwritten. Attachments over 10 MB are refused.",
   inputSchema: {
     issue_id: z.number().int().positive(),
     attachment_id: z.number().int().positive(),
