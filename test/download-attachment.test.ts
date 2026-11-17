@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
@@ -11,11 +11,77 @@ import type { ProjectRef, RedmineAttachment, RedmineIssue } from "../src/types.j
 const rossmannProject: ProjectRef = { id: 1, name: "Market3 Merge Rossmann", identifier: "rossmannmerge" };
 const kasaProject: ProjectRef = { id: 9, name: "Rossmann - Kasa", identifier: "kasa" };
 
-const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
+/** Structurally complete PNG: signature, IHDR with the given size, IEND (pixels are not decoded by the server). */
+function png(width = 1, height = 1): Uint8Array {
+  const bytes = new Uint8Array(45);
+  const view = new DataView(bytes.buffer);
+  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+  view.setUint32(8, 13);
+  bytes.set([0x49, 0x48, 0x44, 0x52], 12);
+  view.setUint32(16, width);
+  view.setUint32(20, height);
+  bytes.set([8, 6, 0, 0, 0], 24);
+  bytes.set([0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82], 33);
+  return bytes;
+}
+
+function jpeg(width = 1, height = 1): Uint8Array {
+  return new Uint8Array([
+    0xff, 0xd8,
+    0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+    0xff, 0xc0, 0x00, 0x11, 0x08, height >> 8, height & 0xff, width >> 8, width & 0xff,
+    0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01,
+    0xff, 0xd9
+  ]);
+}
+
+function gif(width = 1, height = 1): Uint8Array {
+  return new Uint8Array([
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, width & 0xff, width >> 8, height & 0xff, height >> 8, 0x00, 0x00, 0x00, 0x3b
+  ]);
+}
+
+/** Lossless WebP (VP8L) header with the given size; RIFF size matches the length. */
+function webp(width = 1, height = 1): Uint8Array {
+  const bytes = new Uint8Array(30);
+  const view = new DataView(bytes.buffer);
+  bytes.set([0x52, 0x49, 0x46, 0x46], 0);
+  view.setUint32(4, bytes.length - 8, true);
+  bytes.set([0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x4c], 8);
+  view.setUint32(16, 10, true);
+  bytes[20] = 0x2f;
+  const bits = (width - 1) | ((height - 1) << 14);
+  view.setUint32(21, bits, true);
+  return bytes;
+}
+
+/** WebP with a lossy (VP8) or extended (VP8X) header of the given size. */
+function webpVariant(chunk: "VP8 " | "VP8X", width: number, height: number): Uint8Array {
+  const bytes = new Uint8Array(30);
+  const view = new DataView(bytes.buffer);
+  bytes.set([0x52, 0x49, 0x46, 0x46], 0);
+  view.setUint32(4, bytes.length - 8, true);
+  bytes.set([0x57, 0x45, 0x42, 0x50], 8);
+  bytes.set(Array.from(chunk, (char) => char.charCodeAt(0)), 12);
+  view.setUint32(16, 10, true);
+  if (chunk === "VP8 ") {
+    bytes.set([0x9d, 0x01, 0x2a], 23);
+    view.setUint16(26, width, true);
+    view.setUint16(28, height, true);
+  } else {
+    view.setUint16(24, (width - 1) & 0xffff, true);
+    bytes[26] = (width - 1) >> 16;
+    view.setUint16(27, (height - 1) & 0xffff, true);
+    bytes[29] = (height - 1) >> 16;
+  }
+  return bytes;
+}
+
+const PNG = png();
 
 function attachment(overrides: Partial<RedmineAttachment> & Pick<RedmineAttachment, "id" | "filename">): RedmineAttachment {
   return {
-    filesize: 16,
+    filesize: 45,
     content_type: "image/png",
     author: { id: 5, name: "Tomasz Śmierzchała" },
     created_on: "2026-10-28T13:25:45Z",
@@ -46,11 +112,19 @@ function setup(issue: RedmineIssue, download: { bytes: Uint8Array; contentType?:
   return { client, service };
 }
 
+function textFile(id: number, filename: string, text = "x") {
+  return setup(issueWith([attachment({ id, filename, content_type: "text/plain" })]), {
+    bytes: new TextEncoder().encode(text)
+  });
+}
+
 describe("RedmineService.downloadAttachment", () => {
   let saveDir: string;
+  let realSaveDir: string;
 
   beforeEach(async () => {
     saveDir = await mkdtemp(join(tmpdir(), "redmine-mcp-download-test-"));
+    realSaveDir = await realpath(saveDir);
   });
 
   afterEach(async () => {
@@ -108,15 +182,62 @@ describe("RedmineService.downloadAttachment", () => {
     });
   });
 
+  it.each([
+    ["image/jpeg", jpeg(640, 480)],
+    ["image/gif", gif(640, 480)],
+    ["image/webp", webp(640, 480)],
+    ["image/webp", webpVariant("VP8 ", 640, 480)],
+    ["image/webp", webpVariant("VP8X", 640, 480)]
+  ])("returns a %s inline", async (mimeType, bytes) => {
+    const { service } = setup(issueWith([attachment({ id: 2, filename: "img", content_type: mimeType })]), { bytes });
+
+    const result = await service.downloadAttachment({ issue_id: 295390, attachment_id: 2 });
+
+    expect(result.delivered_as).toBe("image");
+    expect(result.image?.mime_type).toBe(mimeType);
+  });
+
   it("takes the image type from the bytes, not from the label", async () => {
-    const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 16, 0x4a, 0x46]);
     const { service } = setup(issueWith([attachment({ id: 2, filename: "photo.png", content_type: "image/png" })]), {
-      bytes: jpeg
+      bytes: jpeg()
     });
 
     const result = await service.downloadAttachment({ issue_id: 295390, attachment_id: 2 });
 
     expect(result.image?.mime_type).toBe("image/jpeg");
+  });
+
+  it.each([
+    ["a truncated PNG (no IEND)", png().subarray(0, 33), /truncated or damaged/],
+    ["a PNG taller than 8000 px", png(1200, 9000), /1200×9000 px.*8000 px/],
+    ["a JPEG wider than 8000 px", jpeg(8001, 10), /8001×10 px/],
+    ["a JPEG without its end marker", jpeg().subarray(0, 39), /truncated or damaged/],
+    ["a GIF without its trailer", gif().subarray(0, 13), /truncated or damaged/],
+    ["a WebP shorter than its RIFF size", webp().subarray(0, 26), /truncated or damaged/],
+    ["an extended WebP wider than 8000 px", webpVariant("VP8X", 70000, 10), /70000×10 px/]
+  ])("saves %s as a file instead of an image block", async (_label, bytes, note) => {
+    const { service } = setup(issueWith([attachment({ id: 20, filename: "shot.png" })]), { bytes });
+
+    const result = await service.downloadAttachment({ issue_id: 295390, attachment_id: 20, save_dir: saveDir });
+
+    expect(result.delivered_as).toBe("file");
+    expect(result.image).toBeUndefined();
+    expect(result.saved_to).toBe(join(realSaveDir, "20-shot.png"));
+    expect(result.note).toMatch(note);
+  });
+
+  it.each([
+    ["a RIFF file that is not WebP (WAV)", new Uint8Array([0x52, 0x49, 0x46, 0x46, 4, 0, 0, 0, 0x57, 0x41, 0x56, 0x45])],
+    ["bytes starting with 0xFF but not a JPEG", new Uint8Array([0xff, 0x00, 0xff, 0xd9])]
+  ])("does not treat %s as an image", async (_label, bytes) => {
+    const { service } = setup(issueWith([attachment({ id: 21, filename: "x.bin", content_type: "application/octet-stream" })]), {
+      bytes
+    });
+
+    const result = await service.downloadAttachment({ issue_id: 295390, attachment_id: 21, save_dir: saveDir });
+
+    expect(result.delivered_as).toBe("file");
+    expect(result.image).toBeUndefined();
   });
 
   it("saves a non-image file under save_dir and returns only its path", async () => {
@@ -130,7 +251,7 @@ describe("RedmineService.downloadAttachment", () => {
 
     expect(result.delivered_as).toBe("file");
     expect(result.image).toBeUndefined();
-    expect(result.saved_to).toBe(join(saveDir, "3-kasa.log"));
+    expect(result.saved_to).toBe(join(realSaveDir, "3-kasa.log"));
     expect(new Uint8Array(await readFile(join(saveDir, "3-kasa.log")))).toEqual(log);
     expect(JSON.stringify(result)).not.toContain("line 1");
   });
@@ -145,7 +266,7 @@ describe("RedmineService.downloadAttachment", () => {
     const result = await service.downloadAttachment({ issue_id: 295390, attachment_id: 987654321 });
 
     try {
-      expect(result.saved_to).toBe(join(tmpdir(), "redmine-mcp-attachments", "987654321-dump.zip"));
+      expect(result.saved_to).toBe(join(await realpath(tmpdir()), "redmine-mcp-attachments", "987654321-dump.zip"));
       expect(new Uint8Array(await readFile(result.saved_to as string))).toEqual(zip);
     } finally {
       await rm(result.saved_to as string, { force: true });
@@ -158,7 +279,7 @@ describe("RedmineService.downloadAttachment", () => {
     const result = await service.downloadAttachment({ issue_id: 295390, attachment_id: 4, save_dir: saveDir });
 
     expect(result.delivered_as).toBe("image");
-    expect(result.saved_to).toBe(join(saveDir, "4-shot.png"));
+    expect(result.saved_to).toBe(join(realSaveDir, "4-shot.png"));
     expect(new Uint8Array(await readFile(join(saveDir, "4-shot.png")))).toEqual(PNG);
   });
 
@@ -170,12 +291,12 @@ describe("RedmineService.downloadAttachment", () => {
 
     expect(result.delivered_as).toBe("file");
     expect(result.image).toBeUndefined();
-    expect(result.saved_to).toBe(join(saveDir, "5-fake.png"));
+    expect(result.saved_to).toBe(join(realSaveDir, "5-fake.png"));
     expect(result.note).toMatch(/not a PNG, JPEG, GIF or WebP/);
   });
 
   it("saves an image too large to show inline, with a note", async () => {
-    const big = new Uint8Array(4 * 1024 * 1024);
+    const big = new Uint8Array(3_750_001);
     big.set(PNG);
     const { service } = setup(issueWith([attachment({ id: 6, filename: "big.png", filesize: big.byteLength })]), {
       bytes: big
@@ -202,24 +323,36 @@ describe("RedmineService.downloadAttachment", () => {
   });
 
   it("keeps the saved file inside save_dir whatever the attachment name", async () => {
-    const text = new TextEncoder().encode("x");
-    const { service } = setup(
-      issueWith([attachment({ id: 8, filename: "..\\..\\evil:name?.txt", content_type: "text/plain" })]),
-      { bytes: text }
-    );
+    const { service } = textFile(8, "..\\..\\evil:name?.txt");
 
     const result = await service.downloadAttachment({ issue_id: 295390, attachment_id: 8, save_dir: saveDir });
 
-    expect(result.saved_to).toBe(join(saveDir, "8-evil_name_.txt"));
+    expect(result.saved_to).toBe(join(realSaveDir, "8-evil_name_.txt"));
     expect(await readdir(saveDir)).toEqual(["8-evil_name_.txt"]);
+  });
+
+  it("replaces control characters in the saved name", async () => {
+    const { service } = textFile(14, "a\u0001b\u001fc.txt");
+
+    const result = await service.downloadAttachment({ issue_id: 295390, attachment_id: 14, save_dir: saveDir });
+
+    expect(result.saved_to).toBe(join(realSaveDir, "14-a_b_c.txt"));
+  });
+
+  it("shortens a very long name but keeps its extension", async () => {
+    const { service } = textFile(15, `${"a".repeat(255)}.txt`);
+
+    const result = await service.downloadAttachment({ issue_id: 295390, attachment_id: 15, save_dir: saveDir });
+
+    const name = basename(result.saved_to as string);
+    expect(name.length).toBeLessThanOrEqual(200);
+    expect(name).toMatch(/^15-a+\.txt$/);
+    expect(await readdir(saveDir)).toEqual([name]);
   });
 
   it("refuses a save_dir outside the system temp directory and creates nothing", async () => {
     const outside = resolve(tmpdir(), "..", `kb24-outside-${process.pid}-${Date.now()}`);
-    const text = new TextEncoder().encode("x");
-    const { service } = setup(issueWith([attachment({ id: 10, filename: "a.bat", content_type: "text/plain" })]), {
-      bytes: text
-    });
+    const { service } = textFile(10, "a.bat");
 
     await expect(
       service.downloadAttachment({ issue_id: 295390, attachment_id: 10, save_dir: join(saveDir, "..", "..", basename(outside)) })
@@ -227,14 +360,27 @@ describe("RedmineService.downloadAttachment", () => {
     await expect(stat(outside)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("refuses the temp directory itself as save_dir", async () => {
+    const { service } = textFile(16, "a.txt");
+
+    await expect(
+      service.downloadAttachment({ issue_id: 295390, attachment_id: 16, save_dir: tmpdir() })
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("temp directory") });
+  });
+
+  it("refuses a relative save_dir", async () => {
+    const { service } = textFile(17, "a.txt");
+
+    await expect(
+      service.downloadAttachment({ issue_id: 295390, attachment_id: 17, save_dir: "~/Downloads" })
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("absolute") });
+  });
+
   it("refuses a save_dir that leaves the temp directory through a junction or symlink", async () => {
     const target = await mkdtemp(join(process.cwd(), ".kb24-link-target-"));
     const link = join(saveDir, "link");
     await symlink(target, link, "junction");
-    const text = new TextEncoder().encode("x");
-    const { service } = setup(issueWith([attachment({ id: 11, filename: "a.bat", content_type: "text/plain" })]), {
-      bytes: text
-    });
+    const { service } = textFile(11, "a.bat");
 
     try {
       await expect(
@@ -250,22 +396,17 @@ describe("RedmineService.downloadAttachment", () => {
     const shared = join(saveDir, "shared");
     await mkdir(shared);
     await chmod(shared, 0o777);
-    const text = new TextEncoder().encode("x");
-    const { service } = setup(issueWith([attachment({ id: 12, filename: "a.txt", content_type: "text/plain" })]), {
-      bytes: text
-    });
+    const { service } = textFile(12, "a.txt");
 
     await expect(
-      service.downloadAttachment({ issue_id: 295390, attachment_id: 12, save_dir: shared })
+      service.downloadAttachment({ issue_id: 295390, attachment_id: 12, save_dir: join(shared, "inner") })
     ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("writable by others") });
-    expect(await readdir(shared)).toEqual([]);
+    expect(await readdir(shared)).toEqual(["inner"]);
+    expect(await readdir(join(shared, "inner"))).toEqual([]);
   });
 
   it.skipIf(process.platform === "win32")("creates the directory and the file private to the user", async () => {
-    const text = new TextEncoder().encode("x");
-    const { service } = setup(issueWith([attachment({ id: 13, filename: "a.txt", content_type: "text/plain" })]), {
-      bytes: text
-    });
+    const { service } = textFile(13, "a.txt");
 
     const result = await service.downloadAttachment({
       issue_id: 295390,
@@ -278,14 +419,11 @@ describe("RedmineService.downloadAttachment", () => {
   });
 
   it("reuses an identical earlier download and never overwrites a different file", async () => {
-    const text = new TextEncoder().encode("same");
-    const { service } = setup(issueWith([attachment({ id: 9, filename: "a.txt", content_type: "text/plain" })]), {
-      bytes: text
-    });
+    const { service } = textFile(9, "a.txt", "same");
 
     await service.downloadAttachment({ issue_id: 295390, attachment_id: 9, save_dir: saveDir });
     const again = await service.downloadAttachment({ issue_id: 295390, attachment_id: 9, save_dir: saveDir });
-    expect(again.saved_to).toBe(join(saveDir, "9-a.txt"));
+    expect(again.saved_to).toBe(join(realSaveDir, "9-a.txt"));
 
     await writeFile(join(saveDir, "9-a.txt"), "someone else's file");
     await expect(

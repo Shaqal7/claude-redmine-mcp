@@ -1,4 +1,5 @@
-import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -50,8 +51,13 @@ export const RELATION_TYPES = [
   "copied_from"
 ] as const;
 export const MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024;
-// Base64 of this many bytes is 5 MiB, the Claude API's per-image limit; larger images are saved as files.
-const MAX_INLINE_IMAGE_BYTES = (5 * 1024 * 1024 * 3) / 4;
+// Base64 of 3 750 000 bytes is 5 000 000 characters: within the 5 MB per-image limit of Amazon Bedrock and
+// Vertex AI (the Claude API itself allows 10 MB). Larger images are saved as files.
+const MAX_INLINE_IMAGE_BYTES = 3_750_000;
+// The Claude API rejects an image wider or taller than this, and a rejected image breaks the whole conversation.
+const MAX_IMAGE_SIDE_PX = 8000;
+// UTF-8 bytes of a saved file name: below the 255 a path segment may have on NTFS and ext4.
+const MAX_SAVED_NAME_BYTES = 200;
 const DEFAULT_ATTACHMENT_DIR_NAME = "redmine-mcp-attachments";
 const INLINE_IMAGE_TYPES: ReadonlySet<string> = new Set<InlineImageType>([
   "image/png",
@@ -500,16 +506,16 @@ export class RedmineService {
       maxBytes: MAX_DOWNLOAD_BYTES
     });
 
-    const imageType = sniffImageType(bytes);
-    const inline = imageType !== null && bytes.byteLength <= MAX_INLINE_IMAGE_BYTES;
+    const image = inspectImage(bytes);
+    const inline = image.kind === "ok";
     let note: string | undefined;
-    if (imageType !== null && !inline) {
-      note = `The image is ${formatMegabytes(bytes.byteLength)}, too large to show inline, so it was saved as a file. Open it with your file tools.`;
-    } else if (imageType === null && meta.content_type && INLINE_IMAGE_TYPES.has(meta.content_type)) {
+    if (image.kind === "unusable") {
+      note = `${image.reason}, so it was saved as a file. Open it with your file tools.`;
+    } else if (image.kind === "none" && meta.content_type && INLINE_IMAGE_TYPES.has(meta.content_type)) {
       note = `Redmine labels this attachment ${meta.content_type}, but its bytes are not a PNG, JPEG, GIF or WebP image, so it was saved as a file.`;
     }
 
-    const saveDir = input.save_dir?.trim();
+    const saveDir = input.save_dir?.trim() || undefined;
     const savedTo = !inline || saveDir ? await this.saveDownloadedAttachment(meta, bytes, saveDir) : null;
 
     return {
@@ -527,34 +533,23 @@ export class RedmineService {
       delivered_as: inline ? "image" : "file",
       saved_to: savedTo,
       ...(note ? { note } : {}),
-      ...(inline && imageType ? { image: { data: Buffer.from(bytes).toString("base64"), mime_type: imageType } } : {})
+      ...(image.kind === "ok" ? { image: { data: Buffer.from(bytes).toString("base64"), mime_type: image.type } } : {})
     };
   }
 
-  /**
-   * Writes <id>-<name> into saveDir (default: the system temp dir); never overwrites a different file.
-   * The bytes and the name come from Redmine users and saveDir from the model, so nothing is written outside the
-   * temp directory (e.g. a .bat into a Startup folder), not even through a junction or symlink.
-   */
+  /** Writes <id>-<name> into the verified save folder; never overwrites a different file. */
   private async saveDownloadedAttachment(
     meta: RedmineAttachment,
     bytes: Uint8Array,
     saveDir: string | undefined
   ): Promise<string> {
-    const directory = saveDir ? resolve(saveDir) : join(tmpdir(), DEFAULT_ATTACHMENT_DIR_NAME);
-    const target = join(directory, `${meta.id}-${localAttachmentFilename(meta.filename)}`);
+    const directory = await prepareSaveDirectory(saveDir);
+    const target = join(directory, localAttachmentFilename(meta.id, meta.filename));
 
     try {
-      await assertInsideTempDir(directory);
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      await assertInsideTempDir(directory);
-      await assertPrivateDirectory(directory);
       await writeFile(target, bytes, { flag: "wx", mode: 0o600 });
       return target;
     } catch (error) {
-      if (error instanceof RedmineMcpError) {
-        throw error;
-      }
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
         throw new RedmineMcpError("VALIDATION_ERROR", `Unable to save the attachment to "${target}": ${reasonOf(error)}.`);
       }
@@ -1383,6 +1378,34 @@ function contentTypeForExtension(extension: string): string {
   return CONTENT_TYPE_BY_EXTENSION[extension.toLowerCase()] ?? "application/octet-stream";
 }
 
+type ImageInspection = { kind: "ok"; type: InlineImageType } | { kind: "unusable"; reason: string } | { kind: "none" };
+
+/**
+ * Whether the bytes may go back as an image block. The API rejects an image that is too big, over 8000 px or broken,
+ * and that breaks the model's whole conversation, so the header (size) and the end-of-file marker are checked.
+ * Pixels are not decoded.
+ */
+function inspectImage(bytes: Uint8Array): ImageInspection {
+  const type = sniffImageType(bytes);
+  if (type === null) {
+    return { kind: "none" };
+  }
+  if (bytes.byteLength > MAX_INLINE_IMAGE_BYTES) {
+    return { kind: "unusable", reason: `The image is ${formatMegabytes(bytes.byteLength)}, too large to show inline` };
+  }
+  const size = readImageSize(bytes, type);
+  if (size === null) {
+    return { kind: "unusable", reason: `The ${type} image looks truncated or damaged` };
+  }
+  if (size.width > MAX_IMAGE_SIDE_PX || size.height > MAX_IMAGE_SIDE_PX) {
+    return {
+      kind: "unusable",
+      reason: `The image is ${size.width}×${size.height} px, over the ${MAX_IMAGE_SIDE_PX} px limit for an image block`
+    };
+  }
+  return { kind: "ok", type };
+}
+
 function sniffImageType(bytes: Uint8Array): InlineImageType | null {
   const startsWith = (signature: number[], offset = 0) =>
     bytes.byteLength >= offset + signature.length && signature.every((byte, index) => bytes[offset + index] === byte);
@@ -1402,14 +1425,158 @@ function sniffImageType(bytes: Uint8Array): InlineImageType | null {
   return null;
 }
 
-async function assertInsideTempDir(directory: string): Promise<void> {
+/** Pixel size from the header, or null when the header or the end-of-file marker is missing. */
+function readImageSize(bytes: Uint8Array, type: InlineImageType): { width: number; height: number } | null {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const length = bytes.byteLength;
+  const endsWith = (tail: number[]) =>
+    length >= tail.length && tail.every((byte, index) => bytes[length - tail.length + index] === byte);
+
+  let size: { width: number; height: number } | null = null;
+  switch (type) {
+    case "image/png":
+      // Signature, IHDR first (width, height), IEND last.
+      if (length >= 45 && view.getUint32(12) === 0x49484452 && endsWith([0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82])) {
+        size = { width: view.getUint32(16), height: view.getUint32(20) };
+      }
+      break;
+    case "image/gif":
+      if (length >= 14 && bytes[length - 1] === 0x3b) {
+        size = { width: view.getUint16(6, true), height: view.getUint16(8, true) };
+      }
+      break;
+    case "image/jpeg":
+      // End of image (FF D9) near the end; some writers pad a few bytes after it.
+      if (hasJpegEnd(bytes)) {
+        size = readJpegSize(bytes, view);
+      }
+      break;
+    case "image/webp":
+      if (length >= 30 && view.getUint32(4, true) + 8 <= length) {
+        size = readWebpSize(bytes, view);
+      }
+      break;
+  }
+  return size !== null && size.width > 0 && size.height > 0 ? size : null;
+}
+
+function hasJpegEnd(bytes: Uint8Array): boolean {
+  for (let index = bytes.byteLength - 2; index >= Math.max(2, bytes.byteLength - 64); index -= 1) {
+    if (bytes[index] === 0xff && bytes[index + 1] === 0xd9) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Walks the JPEG segments to the first frame header (SOFn). */
+function readJpegSize(bytes: Uint8Array, view: DataView): { width: number; height: number } | null {
+  let offset = 2;
+  while (offset + 4 <= bytes.byteLength) {
+    if (bytes[offset] !== 0xff) {
+      return null;
+    }
+    const marker = view.getUint8(offset + 1);
+    if (marker === 0xff) {
+      offset += 1;
+      continue;
+    }
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) {
+      offset += 2;
+      continue;
+    }
+    if (marker === 0xd9 || marker === 0xda) {
+      return null;
+    }
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      return offset + 9 <= bytes.byteLength
+        ? { height: view.getUint16(offset + 5), width: view.getUint16(offset + 7) }
+        : null;
+    }
+    offset += 2 + view.getUint16(offset + 2);
+  }
+  return null;
+}
+
+function readWebpSize(bytes: Uint8Array, view: DataView): { width: number; height: number } | null {
+  const chunk = String.fromCharCode(...bytes.subarray(12, 16));
+  if (chunk === "VP8 ") {
+    if (bytes[23] !== 0x9d || bytes[24] !== 0x01 || bytes[25] !== 0x2a) {
+      return null;
+    }
+    return { width: view.getUint16(26, true) & 0x3fff, height: view.getUint16(28, true) & 0x3fff };
+  }
+  if (chunk === "VP8L") {
+    if (bytes[20] !== 0x2f) {
+      return null;
+    }
+    const bits = view.getUint32(21, true);
+    return { width: (bits & 0x3fff) + 1, height: ((bits >>> 14) & 0x3fff) + 1 };
+  }
+  if (chunk === "VP8X") {
+    return {
+      width: 1 + view.getUint16(24, true) + (view.getUint8(26) << 16),
+      height: 1 + view.getUint16(27, true) + (view.getUint8(29) << 16)
+    };
+  }
+  return null;
+}
+
+/**
+ * The verified real path of the folder to save into (default: <temp>/redmine-mcp-attachments). The name and the
+ * bytes come from Redmine users and save_dir from the model, so the folder must be inside the system temp directory:
+ * no `..`, junction or symlink out of it (e.g. to a Startup folder). Every folder below the temp root must be a real
+ * folder that, on POSIX, belongs to this user and nobody else can write to, so no other user can swap one for a link
+ * between this check and the write.
+ */
+async function prepareSaveDirectory(saveDir: string | undefined): Promise<string> {
   const root = await realpath(tmpdir());
-  const relativePath = relative(root, await realpathOfNearestExisting(directory));
-  if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
+  if (saveDir !== undefined && !isAbsolute(saveDir)) {
     throw new RedmineMcpError(
       "VALIDATION_ERROR",
-      `save_dir "${directory}" is outside the system temp directory (${tmpdir()}); attachments are saved only under it.`
+      `save_dir "${saveDir}" must be an absolute path to a folder inside the system temp directory (${root}); "~" is not expanded.`
     );
+  }
+  const requested = saveDir === undefined ? join(root, DEFAULT_ATTACHMENT_DIR_NAME) : resolve(saveDir);
+  const below = (realPath: string): string | null => {
+    const relativePath = relative(root, realPath);
+    const inside =
+      relativePath !== "" && relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath);
+    return inside ? relativePath : null;
+  };
+  const outside = () =>
+    new RedmineMcpError(
+      "VALIDATION_ERROR",
+      `save_dir "${requested}" is not a folder inside the system temp directory (${root}); attachments are saved only there.`
+    );
+
+  try {
+    if (below(await realpathOfNearestExisting(requested)) === null) {
+      throw outside();
+    }
+    await mkdir(requested, { recursive: true, mode: 0o700 });
+    const directory = await realpath(requested);
+    const relativePath = below(directory);
+    if (relativePath === null) {
+      throw outside();
+    }
+    let current = root;
+    for (const segment of relativePath.split(sep)) {
+      current = join(current, segment);
+      const info = await lstat(current);
+      if (info.isSymbolicLink() || !info.isDirectory() || !isPrivateToUser(info)) {
+        throw new RedmineMcpError(
+          "VALIDATION_ERROR",
+          `"${current}" is a link, belongs to another user or is writable by others; pass a private save_dir.`
+        );
+      }
+    }
+    return directory;
+  } catch (error) {
+    if (error instanceof RedmineMcpError) {
+      throw error;
+    }
+    throw new RedmineMcpError("VALIDATION_ERROR", `Unable to prepare save_dir "${requested}": ${reasonOf(error)}.`);
   }
 }
 
@@ -1431,24 +1598,27 @@ async function realpathOfNearestExisting(path: string): Promise<string> {
   }
 }
 
-/** POSIX only (a Windows temp dir is per-user): the directory must be the user's own and not writable by others. */
-async function assertPrivateDirectory(directory: string): Promise<void> {
-  if (typeof process.getuid !== "function") {
-    return;
-  }
-  const info = await stat(directory);
-  if (info.uid !== process.getuid() || (info.mode & 0o022) !== 0) {
-    throw new RedmineMcpError(
-      "VALIDATION_ERROR",
-      `"${directory}" belongs to another user or is writable by others; pass a private save_dir.`
-    );
-  }
+/** POSIX: owned by this user and not writable by group or others. A Windows temp dir is per-user. */
+function isPrivateToUser(info: Stats): boolean {
+  return typeof process.getuid !== "function" || (info.uid === process.getuid() && (info.mode & 0o022) === 0);
 }
 
-/** A single path segment safe on Windows and POSIX, whatever the attachment's name. */
-function localAttachmentFilename(filename: string): string {
-  const name = redmineStoredFilename(filename).replace(/[\u0000-\u001f]/g, "_");
-  return name === "" || name === "." || name === ".." ? "attachment" : name;
+/** `<id>-<name>`: one path segment safe on Windows and POSIX whatever the attachment's name, cut to fit. */
+function localAttachmentFilename(id: number, filename: string): string {
+  let name = redmineStoredFilename(filename).replace(/[\u0000-\u001f]/g, "_");
+  if (name === "" || name === "." || name === "..") {
+    name = "attachment";
+  }
+  const full = `${id}-${name}`;
+  if (Buffer.byteLength(full) <= MAX_SAVED_NAME_BYTES) {
+    return full;
+  }
+  const extension = extname(name).length <= 16 ? extname(name) : "";
+  const kept = Array.from(full.slice(0, full.length - extension.length));
+  while (Buffer.byteLength(kept.join("") + extension) > MAX_SAVED_NAME_BYTES) {
+    kept.pop();
+  }
+  return kept.join("") + extension;
 }
 
 /** Redmine's Attachment#sanitize_filename: the name it stores, and the one a description has to embed. */

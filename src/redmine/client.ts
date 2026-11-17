@@ -34,6 +34,9 @@ interface RequestOptions {
 
 type FetchLike = typeof fetch;
 
+// A download may be up to 10 MB, so it gets at least this long (body included) whatever REDMINE_TIMEOUT_MS is.
+const MIN_DOWNLOAD_TIMEOUT_MS = 60_000;
+
 export class RedmineClient {
   private readonly projectCache = new Map<string, ProjectRef>();
   private readonly statusCache = new Map<string, NamedRef>();
@@ -307,7 +310,7 @@ export class RedmineClient {
         bytes: await readBodyWithLimit(response, params.maxBytes),
         contentType: response.headers.get("content-type")
       };
-    });
+    }, Math.max(this.config.timeoutMs, MIN_DOWNLOAD_TIMEOUT_MS));
   }
 
   public async listStatuses(): Promise<NamedRef[]> {
@@ -451,9 +454,12 @@ export class RedmineClient {
   }
 
   /** Runs one HTTP exchange (body read included) under the configured timeout and maps transport failures. */
-  private async withTimeout<T>(exchange: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  private async withTimeout<T>(
+    exchange: (signal: AbortSignal) => Promise<T>,
+    timeoutMs = this.config.timeoutMs
+  ): Promise<T> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       return await exchange(controller.signal);
@@ -465,7 +471,7 @@ export class RedmineClient {
       if (error instanceof Error && error.name === "AbortError") {
         throw new RedmineMcpError(
           "UPSTREAM_ERROR",
-          `Redmine request timed out after ${this.config.timeoutMs}ms.`
+          `Redmine request timed out after ${timeoutMs}ms.`
         );
       }
 
