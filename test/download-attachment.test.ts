@@ -1,5 +1,5 @@
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -74,6 +74,35 @@ function webpVariant(chunk: "VP8 " | "VP8X", width: number, height: number): Uin
     view.setUint16(27, (height - 1) & 0xffff, true);
     bytes[29] = (height - 1) >> 16;
   }
+  return bytes;
+}
+
+/**
+ * JPEG with fill bytes before a marker, a scan whose data holds a stuffed FF 00 and a restart marker, the end of image,
+ * then `trailing` bytes of appended data (as phones append metadata or video).
+ */
+function jpegWithScan(trailing = 0): Uint8Array {
+  return new Uint8Array([
+    0xff, 0xd8,
+    0xff, 0xff,
+    0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x20, 0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01,
+    0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3f, 0x00,
+    0x12, 0xff, 0x00, 0x34, 0xff, 0xd0, 0x56,
+    0xff, 0xd9,
+    ...new Array<number>(trailing).fill(0x55)
+  ]);
+}
+
+/** Same length, last byte changed: the end marker is gone but every length guard still passes. */
+function withDamagedEnd(bytes: Uint8Array): Uint8Array {
+  const copy = new Uint8Array(bytes);
+  copy[copy.length - 1] = (copy[copy.length - 1] ?? 0) ^ 0xff;
+  return copy;
+}
+
+function webpWith(change: (bytes: Uint8Array, view: DataView) => void): Uint8Array {
+  const bytes = webp();
+  change(bytes, new DataView(bytes.buffer));
   return bytes;
 }
 
@@ -187,7 +216,9 @@ describe("RedmineService.downloadAttachment", () => {
     ["image/gif", gif(640, 480)],
     ["image/webp", webp(640, 480)],
     ["image/webp", webpVariant("VP8 ", 640, 480)],
-    ["image/webp", webpVariant("VP8X", 640, 480)]
+    ["image/webp", webpVariant("VP8X", 640, 480)],
+    ["image/jpeg", jpegWithScan()],
+    ["image/jpeg", jpegWithScan(500)]
   ])("returns a %s inline", async (mimeType, bytes) => {
     const { service } = setup(issueWith([attachment({ id: 2, filename: "img", content_type: mimeType })]), { bytes });
 
@@ -209,11 +240,16 @@ describe("RedmineService.downloadAttachment", () => {
 
   it.each([
     ["a truncated PNG (no IEND)", png().subarray(0, 33), /truncated or damaged/],
+    ["a PNG whose IEND chunk is damaged", withDamagedEnd(png()), /truncated or damaged/],
     ["a PNG taller than 8000 px", png(1200, 9000), /1200×9000 px.*8000 px/],
     ["a JPEG wider than 8000 px", jpeg(8001, 10), /8001×10 px/],
     ["a JPEG without its end marker", jpeg().subarray(0, 39), /truncated or damaged/],
+    ["a JPEG cut inside its scan data", jpegWithScan().subarray(0, 42), /truncated or damaged/],
     ["a GIF without its trailer", gif().subarray(0, 13), /truncated or damaged/],
+    ["a GIF whose trailer is damaged", withDamagedEnd(gif()), /truncated or damaged/],
     ["a WebP shorter than its RIFF size", webp().subarray(0, 26), /truncated or damaged/],
+    ["a WebP whose RIFF size exceeds the file", webpWith((_bytes, view) => view.setUint32(4, 23, true)), /truncated or damaged/],
+    ["a lossless WebP without its signature byte", webpWith((bytes) => (bytes[20] = 0)), /truncated or damaged/],
     ["an extended WebP wider than 8000 px", webpVariant("VP8X", 70000, 10), /70000×10 px/]
   ])("saves %s as a file instead of an image block", async (_label, bytes, note) => {
     const { service } = setup(issueWith([attachment({ id: 20, filename: "shot.png" })]), { bytes });
@@ -238,6 +274,7 @@ describe("RedmineService.downloadAttachment", () => {
 
     expect(result.delivered_as).toBe("file");
     expect(result.image).toBeUndefined();
+    expect(result.note).toBeUndefined();
   });
 
   it("saves a non-image file under save_dir and returns only its path", async () => {
@@ -350,6 +387,22 @@ describe("RedmineService.downloadAttachment", () => {
     expect(await readdir(saveDir)).toEqual([name]);
   });
 
+  it.each([
+    ["a name ending in a dot and a space", "report. ", "18-report"],
+    ["a long name cut at a dot and a space", `${"a".repeat(196)}. ${"c".repeat(40)}`, null]
+  ])("drops a trailing dot or space from the saved name (%s)", async (_label, filename, expected) => {
+    const { service } = textFile(18, filename);
+
+    const result = await service.downloadAttachment({ issue_id: 295390, attachment_id: 18, save_dir: saveDir });
+
+    const name = basename(result.saved_to as string);
+    expect(name).not.toMatch(/[. ]$/);
+    if (expected) {
+      expect(name).toBe(expected);
+    }
+    expect(await readdir(saveDir)).toEqual([name]);
+  });
+
   it("refuses a save_dir outside the system temp directory and creates nothing", async () => {
     const outside = resolve(tmpdir(), "..", `kb24-outside-${process.pid}-${Date.now()}`);
     const { service } = textFile(10, "a.bat");
@@ -377,18 +430,22 @@ describe("RedmineService.downloadAttachment", () => {
   });
 
   it("refuses a save_dir that leaves the temp directory through a junction or symlink", async () => {
-    const target = await mkdtemp(join(process.cwd(), ".kb24-link-target-"));
-    const link = join(saveDir, "link");
-    await symlink(target, link, "junction");
     const { service } = textFile(11, "a.bat");
+    let target: string | undefined;
 
     try {
+      // The home directory stands for "outside temp" even when the checkout itself lives under temp.
+      target = await mkdtemp(join(homedir(), ".kb24-link-target-"));
+      const link = join(saveDir, "link");
+      await symlink(target, link, "junction");
       await expect(
         service.downloadAttachment({ issue_id: 295390, attachment_id: 11, save_dir: join(link, "sub") })
       ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("temp directory") });
       expect(await readdir(target)).toEqual([]);
     } finally {
-      await rm(target, { recursive: true, force: true });
+      if (target) {
+        await rm(target, { recursive: true, force: true });
+      }
     }
   });
 
@@ -401,8 +458,8 @@ describe("RedmineService.downloadAttachment", () => {
     await expect(
       service.downloadAttachment({ issue_id: 295390, attachment_id: 12, save_dir: join(shared, "inner") })
     ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("writable by others") });
-    expect(await readdir(shared)).toEqual(["inner"]);
-    expect(await readdir(join(shared, "inner"))).toEqual([]);
+    // Refused before mkdir: another user could have put a link where "inner" was to be created.
+    expect(await readdir(shared)).toEqual([]);
   });
 
   it.skipIf(process.platform === "win32")("creates the directory and the file private to the user", async () => {

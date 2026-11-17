@@ -1446,10 +1446,7 @@ function readImageSize(bytes: Uint8Array, type: InlineImageType): { width: numbe
       }
       break;
     case "image/jpeg":
-      // End of image (FF D9) near the end; some writers pad a few bytes after it.
-      if (hasJpegEnd(bytes)) {
-        size = readJpegSize(bytes, view);
-      }
+      size = readJpegSize(bytes, view);
       break;
     case "image/webp":
       if (length >= 30 && view.getUint32(4, true) + 8 <= length) {
@@ -1460,20 +1457,17 @@ function readImageSize(bytes: Uint8Array, type: InlineImageType): { width: numbe
   return size !== null && size.width > 0 && size.height > 0 ? size : null;
 }
 
-function hasJpegEnd(bytes: Uint8Array): boolean {
-  for (let index = bytes.byteLength - 2; index >= Math.max(2, bytes.byteLength - 64); index -= 1) {
-    if (bytes[index] === 0xff && bytes[index + 1] === 0xd9) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/** Walks the JPEG segments to the first frame header (SOFn). */
+/**
+ * Walks the JPEG segments and scans to the end of image (FF D9): the size comes from the first frame header (SOFn),
+ * and a file without its end marker is truncated. Data appended after the end (phone metadata, motion photos) is
+ * ignored.
+ */
 function readJpegSize(bytes: Uint8Array, view: DataView): { width: number; height: number } | null {
+  const length = bytes.byteLength;
+  let size: { width: number; height: number } | null = null;
   let offset = 2;
-  while (offset + 4 <= bytes.byteLength) {
-    if (bytes[offset] !== 0xff) {
+  while (offset + 2 <= length) {
+    if (view.getUint8(offset) !== 0xff) {
       return null;
     }
     const marker = view.getUint8(offset + 1);
@@ -1481,19 +1475,33 @@ function readJpegSize(bytes: Uint8Array, view: DataView): { width: number; heigh
       offset += 1;
       continue;
     }
+    if (marker === 0xd9) {
+      return size;
+    }
     if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) {
       offset += 2;
       continue;
     }
-    if (marker === 0xd9 || marker === 0xda) {
+    if (offset + 4 > length) {
       return null;
     }
-    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
-      return offset + 9 <= bytes.byteLength
-        ? { height: view.getUint16(offset + 5), width: view.getUint16(offset + 7) }
-        : null;
+    if (size === null && marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      if (offset + 9 > length) {
+        return null;
+      }
+      size = { height: view.getUint16(offset + 5), width: view.getUint16(offset + 7) };
     }
     offset += 2 + view.getUint16(offset + 2);
+    if (marker === 0xda) {
+      // Entropy-coded data runs to the next marker; FF 00 (stuffed byte) and FF D0-D7 (restart) belong to it.
+      while (offset + 1 < length) {
+        const next = view.getUint8(offset + 1);
+        if (view.getUint8(offset) === 0xff && next !== 0x00 && !(next >= 0xd0 && next <= 0xd7)) {
+          break;
+        }
+        offset += 1;
+      }
+    }
   }
   return null;
 }
@@ -1526,8 +1534,9 @@ function readWebpSize(bytes: Uint8Array, view: DataView): { width: number; heigh
  * The verified real path of the folder to save into (default: <temp>/redmine-mcp-attachments). The name and the
  * bytes come from Redmine users and save_dir from the model, so the folder must be inside the system temp directory:
  * no `..`, junction or symlink out of it (e.g. to a Startup folder). Every folder below the temp root must be a real
- * folder that, on POSIX, belongs to this user and nobody else can write to, so no other user can swap one for a link
- * between this check and the write.
+ * folder that, on POSIX, belongs to this user and nobody else can write to. That is checked for the existing folders
+ * before mkdir (nobody else can put a link where a missing folder is to be created) and for all of them after it
+ * (nobody else can swap one for a link before the write).
  */
 async function prepareSaveDirectory(saveDir: string | undefined): Promise<string> {
   const root = await realpath(tmpdir());
@@ -1538,12 +1547,6 @@ async function prepareSaveDirectory(saveDir: string | undefined): Promise<string
     );
   }
   const requested = saveDir === undefined ? join(root, DEFAULT_ATTACHMENT_DIR_NAME) : resolve(saveDir);
-  const below = (realPath: string): string | null => {
-    const relativePath = relative(root, realPath);
-    const inside =
-      relativePath !== "" && relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath);
-    return inside ? relativePath : null;
-  };
   const outside = () =>
     new RedmineMcpError(
       "VALIDATION_ERROR",
@@ -1551,26 +1554,17 @@ async function prepareSaveDirectory(saveDir: string | undefined): Promise<string
     );
 
   try {
-    if (below(await realpathOfNearestExisting(requested)) === null) {
+    const { existing, missing } = await nearestExistingFolder(requested);
+    if (pathBelow(root, join(existing, ...missing)) === null) {
       throw outside();
     }
+    await assertPrivateFolders(root, existing);
     await mkdir(requested, { recursive: true, mode: 0o700 });
     const directory = await realpath(requested);
-    const relativePath = below(directory);
-    if (relativePath === null) {
+    if (pathBelow(root, directory) === null) {
       throw outside();
     }
-    let current = root;
-    for (const segment of relativePath.split(sep)) {
-      current = join(current, segment);
-      const info = await lstat(current);
-      if (info.isSymbolicLink() || !info.isDirectory() || !isPrivateToUser(info)) {
-        throw new RedmineMcpError(
-          "VALIDATION_ERROR",
-          `"${current}" is a link, belongs to another user or is writable by others; pass a private save_dir.`
-        );
-      }
-    }
+    await assertPrivateFolders(root, directory);
     return directory;
   } catch (error) {
     if (error instanceof RedmineMcpError) {
@@ -1580,13 +1574,40 @@ async function prepareSaveDirectory(saveDir: string | undefined): Promise<string
   }
 }
 
-/** realpath of the nearest existing ancestor with the missing segments appended (junctions and symlinks resolved). */
-async function realpathOfNearestExisting(path: string): Promise<string> {
+/** The path of `realPath` relative to `root` when it lies strictly below it, else null. */
+function pathBelow(root: string, realPath: string): string | null {
+  const relativePath = relative(root, realPath);
+  const below =
+    relativePath !== "" && relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath);
+  return below ? relativePath : null;
+}
+
+/** Every folder from below `root` down to `realPath` (which is `root` or below it) must be private to this user. */
+async function assertPrivateFolders(root: string, realPath: string): Promise<void> {
+  const relativePath = pathBelow(root, realPath);
+  if (relativePath === null) {
+    return;
+  }
+  let current = root;
+  for (const segment of relativePath.split(sep)) {
+    current = join(current, segment);
+    const info = await lstat(current);
+    if (info.isSymbolicLink() || !info.isDirectory() || !isPrivateToUser(info)) {
+      throw new RedmineMcpError(
+        "VALIDATION_ERROR",
+        `"${current}" is a link, belongs to another user or is writable by others; pass a private save_dir.`
+      );
+    }
+  }
+}
+
+/** realpath of the nearest existing ancestor (junctions and symlinks resolved) and the missing segments below it. */
+async function nearestExistingFolder(path: string): Promise<{ existing: string; missing: string[] }> {
   const missing: string[] = [];
   let current = path;
   for (;;) {
     try {
-      return join(await realpath(current), ...missing);
+      return { existing: await realpath(current), missing };
     } catch (error) {
       const parent = dirname(current);
       if ((error as NodeJS.ErrnoException).code !== "ENOENT" || parent === current) {
@@ -1603,12 +1624,12 @@ function isPrivateToUser(info: Stats): boolean {
   return typeof process.getuid !== "function" || (info.uid === process.getuid() && (info.mode & 0o022) === 0);
 }
 
-/** `<id>-<name>`: one path segment safe on Windows and POSIX whatever the attachment's name, cut to fit. */
+/**
+ * `<id>-<name>`: one path segment safe on Windows and POSIX whatever the attachment's name, cut to fit. A trailing
+ * dot or space is dropped: Windows tools outside Node cannot open such a file.
+ */
 function localAttachmentFilename(id: number, filename: string): string {
-  let name = redmineStoredFilename(filename).replace(/[\u0000-\u001f]/g, "_");
-  if (name === "" || name === "." || name === "..") {
-    name = "attachment";
-  }
+  const name = redmineStoredFilename(filename).replace(/[\u0000-\u001f]/g, "_").replace(/[. ]+$/, "") || "attachment";
   const full = `${id}-${name}`;
   if (Buffer.byteLength(full) <= MAX_SAVED_NAME_BYTES) {
     return full;
@@ -1618,7 +1639,7 @@ function localAttachmentFilename(id: number, filename: string): string {
   while (Buffer.byteLength(kept.join("") + extension) > MAX_SAVED_NAME_BYTES) {
     kept.pop();
   }
-  return kept.join("") + extension;
+  return (kept.join("") + extension).replace(/[. ]+$/, "");
 }
 
 /** Redmine's Attachment#sanitize_filename: the name it stores, and the one a description has to embed. */
