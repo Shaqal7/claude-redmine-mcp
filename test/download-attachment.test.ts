@@ -1,6 +1,6 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -212,6 +212,69 @@ describe("RedmineService.downloadAttachment", () => {
 
     expect(result.saved_to).toBe(join(saveDir, "8-evil_name_.txt"));
     expect(await readdir(saveDir)).toEqual(["8-evil_name_.txt"]);
+  });
+
+  it("refuses a save_dir outside the system temp directory and creates nothing", async () => {
+    const outside = resolve(tmpdir(), "..", `kb24-outside-${process.pid}-${Date.now()}`);
+    const text = new TextEncoder().encode("x");
+    const { service } = setup(issueWith([attachment({ id: 10, filename: "a.bat", content_type: "text/plain" })]), {
+      bytes: text
+    });
+
+    await expect(
+      service.downloadAttachment({ issue_id: 295390, attachment_id: 10, save_dir: join(saveDir, "..", "..", basename(outside)) })
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("temp directory") });
+    await expect(stat(outside)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("refuses a save_dir that leaves the temp directory through a junction or symlink", async () => {
+    const target = await mkdtemp(join(process.cwd(), ".kb24-link-target-"));
+    const link = join(saveDir, "link");
+    await symlink(target, link, "junction");
+    const text = new TextEncoder().encode("x");
+    const { service } = setup(issueWith([attachment({ id: 11, filename: "a.bat", content_type: "text/plain" })]), {
+      bytes: text
+    });
+
+    try {
+      await expect(
+        service.downloadAttachment({ issue_id: 295390, attachment_id: 11, save_dir: join(link, "sub") })
+      ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("temp directory") });
+      expect(await readdir(target)).toEqual([]);
+    } finally {
+      await rm(target, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("refuses a directory that other users can write to", async () => {
+    const shared = join(saveDir, "shared");
+    await mkdir(shared);
+    await chmod(shared, 0o777);
+    const text = new TextEncoder().encode("x");
+    const { service } = setup(issueWith([attachment({ id: 12, filename: "a.txt", content_type: "text/plain" })]), {
+      bytes: text
+    });
+
+    await expect(
+      service.downloadAttachment({ issue_id: 295390, attachment_id: 12, save_dir: shared })
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR", message: expect.stringContaining("writable by others") });
+    expect(await readdir(shared)).toEqual([]);
+  });
+
+  it.skipIf(process.platform === "win32")("creates the directory and the file private to the user", async () => {
+    const text = new TextEncoder().encode("x");
+    const { service } = setup(issueWith([attachment({ id: 13, filename: "a.txt", content_type: "text/plain" })]), {
+      bytes: text
+    });
+
+    const result = await service.downloadAttachment({
+      issue_id: 295390,
+      attachment_id: 13,
+      save_dir: join(saveDir, "fresh")
+    });
+
+    expect((await stat(join(saveDir, "fresh"))).mode & 0o777).toBe(0o700);
+    expect((await stat(result.saved_to as string)).mode & 0o777).toBe(0o600);
   });
 
   it("reuses an identical earlier download and never overwrites a different file", async () => {

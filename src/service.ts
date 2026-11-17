@@ -1,6 +1,6 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, extname, join, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { RedmineMcpError } from "./errors.js";
 import { normalizeIssueDetail, normalizeIssueSummary } from "./redmine/normalize.js";
@@ -531,7 +531,11 @@ export class RedmineService {
     };
   }
 
-  /** Writes <id>-<name> into saveDir (default: the system temp dir); never overwrites a different file. */
+  /**
+   * Writes <id>-<name> into saveDir (default: the system temp dir); never overwrites a different file.
+   * The bytes and the name come from Redmine users and saveDir from the model, so nothing is written outside the
+   * temp directory (e.g. a .bat into a Startup folder), not even through a junction or symlink.
+   */
   private async saveDownloadedAttachment(
     meta: RedmineAttachment,
     bytes: Uint8Array,
@@ -541,10 +545,16 @@ export class RedmineService {
     const target = join(directory, `${meta.id}-${localAttachmentFilename(meta.filename)}`);
 
     try {
-      await mkdir(directory, { recursive: true });
-      await writeFile(target, bytes, { flag: "wx" });
+      await assertInsideTempDir(directory);
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await assertInsideTempDir(directory);
+      await assertPrivateDirectory(directory);
+      await writeFile(target, bytes, { flag: "wx", mode: 0o600 });
       return target;
     } catch (error) {
+      if (error instanceof RedmineMcpError) {
+        throw error;
+      }
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
         throw new RedmineMcpError("VALIDATION_ERROR", `Unable to save the attachment to "${target}": ${reasonOf(error)}.`);
       }
@@ -1390,6 +1400,49 @@ function sniffImageType(bytes: Uint8Array): InlineImageType | null {
     return "image/webp";
   }
   return null;
+}
+
+async function assertInsideTempDir(directory: string): Promise<void> {
+  const root = await realpath(tmpdir());
+  const relativePath = relative(root, await realpathOfNearestExisting(directory));
+  if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
+    throw new RedmineMcpError(
+      "VALIDATION_ERROR",
+      `save_dir "${directory}" is outside the system temp directory (${tmpdir()}); attachments are saved only under it.`
+    );
+  }
+}
+
+/** realpath of the nearest existing ancestor with the missing segments appended (junctions and symlinks resolved). */
+async function realpathOfNearestExisting(path: string): Promise<string> {
+  const missing: string[] = [];
+  let current = path;
+  for (;;) {
+    try {
+      return join(await realpath(current), ...missing);
+    } catch (error) {
+      const parent = dirname(current);
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || parent === current) {
+        throw error;
+      }
+      missing.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
+
+/** POSIX only (a Windows temp dir is per-user): the directory must be the user's own and not writable by others. */
+async function assertPrivateDirectory(directory: string): Promise<void> {
+  if (typeof process.getuid !== "function") {
+    return;
+  }
+  const info = await stat(directory);
+  if (info.uid !== process.getuid() || (info.mode & 0o022) !== 0) {
+    throw new RedmineMcpError(
+      "VALIDATION_ERROR",
+      `"${directory}" belongs to another user or is writable by others; pass a private save_dir.`
+    );
+  }
 }
 
 /** A single path segment safe on Windows and POSIX, whatever the attachment's name. */

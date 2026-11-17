@@ -54,7 +54,7 @@ server.registerTool("get_issue", {
 
 server.registerTool("download_attachment", {
   description:
-    "Download one attachment of an issue in an allowed Redmine project so you can look at it (read-only: nothing is written to Redmine). Get attachment_id from get_issue; the attachment must belong to issue_id. A PNG, JPEG, GIF or WebP image up to 3.75 MB comes back as an image you see directly, with its name, size, author and date (it is also saved when save_dir is given). Any other file, or a larger image, is saved as <attachment_id>-<filename> under save_dir (on the MCP server's filesystem; default: a redmine-mcp-attachments folder in the system temp directory) and only its path is returned: open it with your file tools. An existing file with different content is never overwritten. Attachments over 10 MB are refused.",
+    "Download one attachment of an issue in an allowed Redmine project so you can look at it (read-only: nothing is written to Redmine). Get attachment_id from get_issue; the attachment must belong to issue_id. A PNG, JPEG, GIF or WebP image up to 3.75 MB comes back as an image you see directly, with its name, size, author and date (it is also saved when save_dir is given). Any other file, or a larger image, is saved as <attachment_id>-<filename> under save_dir and only its path is returned: open it with your file tools. save_dir is a folder on the MCP server's filesystem and must be inside the system temp directory (default: its redmine-mcp-attachments folder); anything else is refused. An existing file with different content is never overwritten. Attachments over 10 MB are refused.",
   inputSchema: {
     issue_id: z.number().int().positive(),
     attachment_id: z.number().int().positive(),
