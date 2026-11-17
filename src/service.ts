@@ -1596,8 +1596,9 @@ async function prepareDownloadFolder(downloadDir: string): Promise<string> {
 /**
  * POSIX (OpenSSH's safe_path, plus links): nobody but this user and root can rename or replace anything on the way to
  * `path`. Every folder above it belongs to one of them and is not writable by group or others, or is sticky (as /tmp
- * is); every link above it belongs to one of them. Checked on the configured path before mkdir and on the real path
- * after it. Windows: not checked (keep REDMINE_DOWNLOAD_DIR per-user, as TEMP is).
+ * is). Every link above it belongs to root (e.g. macOS /var): a user's own link could lead through folders that are
+ * checked only after mkdir. Checked on the configured path before mkdir and on the real path after it.
+ * Windows: not checked (keep REDMINE_DOWNLOAD_DIR per-user, as TEMP is).
  */
 async function assertSafeAncestors(path: string, downloadDir: string, hint: string): Promise<void> {
   if (typeof process.getuid !== "function") {
@@ -1606,14 +1607,21 @@ async function assertSafeAncestors(path: string, downloadDir: string, hint: stri
   const uid = process.getuid();
   for (let current = dirname(path); ; current = dirname(current)) {
     const info = await lstat(current);
-    const owned = info.uid === 0 || info.uid === uid;
-    const safe = info.isSymbolicLink()
-      ? owned
-      : info.isDirectory() && owned && ((info.mode & 0o022) === 0 || (info.mode & 0o1000) !== 0);
-    if (!safe) {
+    const problem = info.isSymbolicLink()
+      ? info.uid === 0
+        ? null
+        : "is a link not owned by root"
+      : !info.isDirectory()
+        ? "is not a folder"
+        : info.uid !== 0 && info.uid !== uid
+          ? "belongs to another user"
+          : (info.mode & 0o022) !== 0 && (info.mode & 0o1000) === 0
+            ? "is writable by group or others and not sticky"
+            : null;
+    if (problem !== null) {
       throw new RedmineMcpError(
         "VALIDATION_ERROR",
-        `"${current}" lets other users rename or replace folders on the way to the download folder "${downloadDir}"; ${hint}.`
+        `"${current}" ${problem}, but other users must not be able to rename or replace anything on the way to the download folder "${downloadDir}"; ${hint}.`
       );
     }
     if (dirname(current) === current) {

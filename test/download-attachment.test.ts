@@ -595,6 +595,20 @@ describe("RedmineService.downloadAttachment", () => {
     await expect(stat(join(above, "dl"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it.skipIf(process.platform === "win32")("refuses a download folder reached through a link not owned by root, before creating it", async () => {
+    // KB-26 N1: the user's own link could point through folders that are checked only after mkdir.
+    const real = join(saveDir, "real");
+    await mkdir(real);
+    await symlink(real, join(saveDir, "link"));
+    const { service } = textFile(26, "a.txt", "x", join(saveDir, "link", "dl"));
+
+    await expect(service.downloadAttachment({ issue_id: 295390, attachment_id: 26 })).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+      message: expect.stringContaining("is a link not owned by root")
+    });
+    await expect(stat(join(real, "dl"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it.skipIf(process.platform === "win32")("accepts a download folder in a sticky folder others can write to, as /tmp", async () => {
     const sticky = join(saveDir, "sticky");
     await mkdir(sticky);
