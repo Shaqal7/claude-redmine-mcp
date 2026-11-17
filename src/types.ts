@@ -361,3 +361,27 @@ export interface CreateIssueResult {
   url: string | null;
   issue: NormalizedIssueSummary | null;
 }
+
+export type InlineImageType = "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+
+export interface DownloadedAttachment {
+  issue_id: number;
+  id: number;
+  filename: string;
+  /** Bytes actually downloaded. */
+  filesize: number;
+  content_type: string | null;
+  description: string | null;
+  author: string | null;
+  created_on: string | null;
+  url: string | null;
+}
+
+export interface DownloadAttachmentResult {
+  attachment: DownloadedAttachment;
+  delivered_as: "image" | "file";
+  saved_to: string | null;
+  note?: string;
+  /** Turned into MCP image content by the tool handler, never into the text block. */
+  image?: { data: string; mime_type: InlineImageType };
+}

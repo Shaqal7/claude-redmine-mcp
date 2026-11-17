@@ -7,6 +7,7 @@ Local MCP server for Claude Code that exposes a narrow, issue-focused Redmine in
 - `list_issues` — compact issue summaries for one allowed project
 - `search_issues` — full-text search via Redmine's own search engine (`/projects/{id}/search.json`) over the whole project history: subjects, descriptions **and journal notes**; returns a `match_excerpt` per hit. Options: `all_words` (default `true`), `titles_only`. Falls back to scanning the 100 most recently updated issues (`mode: "scan"`) only if the search endpoint is unavailable.
 - `get_issue` — normalized detail with journals (incl. journal ids), relations, custom fields, attachments, parent and children
+- `download_attachment` — read-only: download one attachment of an allowed issue (`issue_id` + `attachment_id` from `get_issue`; the attachment must belong to that issue). PNG, JPEG, GIF and WebP images up to 3.75 MB come back as MCP image content the model sees directly; any other file (or a larger image) is saved as `<attachment_id>-<filename>` under `save_dir` (default: `redmine-mcp-attachments` in the system temp directory) and only the path is returned. Limit 10 MB. The API key is sent only to `REDMINE_BASE_URL` and never appears in results or errors.
 - `add_issue_note` — append a note (requires user confirmation)
 - `update_issue_note` / `delete_issue_note` — edit or remove an existing note by `journal_id` via `PUT /journals/{id}.json` (Redmine 5.0+, needs edit-notes permission; read-after-write verified)
 - `update_issue_status` — change issue status with validation

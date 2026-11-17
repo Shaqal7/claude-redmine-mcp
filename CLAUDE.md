@@ -65,6 +65,14 @@ Redmine attachments are a two-step flow: `POST /uploads.json` with raw bytes + f
 - `attach_file_to_test_chain` reuses the same chain traversal as `resolve_related_test_chain` (test → same-project → external) but **only attaches to test + external**. The same-project issue is required for topology resolution but not modified.
 - `resolve_chain_with_attachment` is the combined variant: one PUT per chain issue carrying `{ status_id, notes, uploads }` so each of the three issues gets a single journal entry (status change + note + attachment together). All three chain issues receive the attachment in this variant. The chain traversal is shared via the `findTestChain` helper in `src/service.ts`.
 
+### `download_attachment`
+
+Read-only (nothing is written to Redmine). The issue is loaded through `getAuthorizedIssue` (allowlist → the same `POLICY_ERROR` as `get_issue`), and the attachment id must be in that issue's `attachments` (`NOT_FOUND` otherwise, with the ids that are there) before anything is downloaded. Redmine's `filesize` over `MAX_DOWNLOAD_BYTES` (10 MB) is refused up front; the client also checks `Content-Length` and stops reading a body that grows past the limit.
+
+- `client.downloadAttachment` sends the API key header only to `REDMINE_BASE_URL`: a `content_url` on another origin, on plain http or outside the base path is replaced by `{base}/attachments/download/{id}`. Redirects are not followed (`redirect: "manual"`; fetch keeps custom headers on a cross-origin redirect); a redirect to `/login` is `AUTH_ERROR`. The key is never in a URL, result or error.
+- The image type comes from the bytes (PNG/JPEG/GIF/WebP magic numbers), not from Redmine's label: an invalid image block would break the model's conversation. Images up to 3.75 MB (5 MiB in base64, the Claude API limit) go back as MCP `image` content next to a JSON text block; the handler (`handleToolContent` in `tool-handlers.ts`) moves `image` out of the JSON.
+- Everything else, a larger image, or any image when `save_dir` is given, is written as `<id>-<sanitized name>` (`redmineStoredFilename` + control characters) under `save_dir` (resolved against the server's cwd) or `os.tmpdir()/redmine-mcp-attachments`, with `flag: "wx"`: an identical existing file is reused, a different one is left untouched (`VALIDATION_ERROR`). File contents never go into the result.
+
 ### `create_issue`
 
 `POST /issues.json` into one allowed project, then `POST /issues/{id}/relations.json` when `related_issue_id` is given. Order of checks: project allowlist (`resolveProject`) → related issue through `getAuthorizedIssue` → metadata reads → write, so a policy rejection never leaves a created issue behind.

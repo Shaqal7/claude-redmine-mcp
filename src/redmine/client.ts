@@ -254,6 +254,62 @@ export class RedmineClient {
     return response.upload.token;
   }
 
+  /**
+   * Download an attachment's bytes with the API key. The key goes only to the configured base URL: a content_url
+   * on another origin or outside the base path is replaced by the base URL's /attachments/download/{id} route.
+   * Redirects are not followed (a cross-origin redirect would carry the key header along).
+   */
+  public async downloadAttachment(params: {
+    attachmentId: number;
+    contentUrl?: string;
+    maxBytes: number;
+  }): Promise<{ bytes: Uint8Array; contentType: string | null }> {
+    const url = this.isUnderBaseUrl(params.contentUrl)
+      ? new URL(params.contentUrl as string)
+      : new URL(`${this.config.redmineBaseUrl}/attachments/download/${params.attachmentId}`);
+
+    return this.withTimeout(async (signal) => {
+      const response = await this.fetchImpl(url, {
+        method: "GET",
+        headers: {
+          "Accept": "*/*",
+          "X-Redmine-API-Key": this.config.redmineApiKey
+        },
+        redirect: "manual",
+        signal
+      });
+
+      if (response.status >= 300 && response.status < 400) {
+        await response.body?.cancel();
+        if (redirectsToLogin(response.headers.get("location"), url)) {
+          throw new RedmineMcpError(
+            "AUTH_ERROR",
+            "Redmine redirected the attachment download to the login page: the API key cannot read this attachment.",
+            { status: response.status }
+          );
+        }
+        throw new RedmineMcpError(
+          "UPSTREAM_ERROR",
+          `Redmine answered the attachment download with a redirect (${response.status}).`,
+          { status: response.status }
+        );
+      }
+
+      await assertResponseOk(response);
+
+      const declaredLength = Number(response.headers.get("content-length"));
+      if (Number.isFinite(declaredLength) && declaredLength > params.maxBytes) {
+        await response.body?.cancel();
+        throw downloadLimitError(params.maxBytes);
+      }
+
+      return {
+        bytes: await readBodyWithLimit(response, params.maxBytes),
+        contentType: response.headers.get("content-type")
+      };
+    });
+  }
+
   public async listStatuses(): Promise<NamedRef[]> {
     if (this.statusCache.size > 0) {
       return dedupeRefs([...this.statusCache.values()]);
@@ -342,10 +398,7 @@ export class RedmineClient {
   }
 
   private async request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
-
-    try {
+    return this.withTimeout(async (signal) => {
       const url = new URL(`${this.config.redmineBaseUrl}${path}`);
       for (const [key, value] of Object.entries(options.query ?? {})) {
         if (value !== undefined) {
@@ -371,44 +424,39 @@ export class RedmineClient {
         method: options.method ?? "GET",
         headers,
         body,
-        signal: controller.signal
+        signal
       });
 
-      if (response.status === 401 || response.status === 403) {
-        throw new RedmineMcpError(
-          "AUTH_ERROR",
-          "Redmine rejected the API key or denied access.",
-          { status: response.status }
-        );
-      }
-
-      if (response.status === 404) {
-        throw new RedmineMcpError("NOT_FOUND", "The requested Redmine resource was not found.");
-      }
-
-      if (response.status === 422) {
-        const payload = (await safeJson(response)) as { errors?: string[] } | undefined;
-        throw new RedmineMcpError(
-          "VALIDATION_ERROR",
-          payload?.errors?.join("; ") || "Redmine rejected the request as invalid.",
-          payload
-        );
-      }
-
-      if (!response.ok) {
-        const payload = await safeJson(response);
-        throw new RedmineMcpError(
-          "UPSTREAM_ERROR",
-          `Redmine request failed with ${response.status} ${response.statusText}.`,
-          payload
-        );
-      }
+      await assertResponseOk(response);
 
       if (response.status === 204) {
         return undefined as T;
       }
 
       return (await response.json()) as T;
+    });
+  }
+
+  private isUnderBaseUrl(candidate: string | undefined): boolean {
+    if (!candidate) {
+      return false;
+    }
+    try {
+      const url = new URL(candidate);
+      const base = new URL(this.config.redmineBaseUrl);
+      return url.origin === base.origin && url.pathname.startsWith(`${base.pathname.replace(/\/$/, "")}/`);
+    } catch {
+      return false;
+    }
+  }
+
+  /** Runs one HTTP exchange (body read included) under the configured timeout and maps transport failures. */
+  private async withTimeout<T>(exchange: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+
+    try {
+      return await exchange(controller.signal);
     } catch (error) {
       if (error instanceof RedmineMcpError) {
         throw error;
@@ -458,4 +506,89 @@ async function safeJson(response: Response): Promise<unknown> {
   } catch {
     return undefined;
   }
+}
+
+async function assertResponseOk(response: Response): Promise<void> {
+  if (response.status === 401 || response.status === 403) {
+    throw new RedmineMcpError(
+      "AUTH_ERROR",
+      "Redmine rejected the API key or denied access.",
+      { status: response.status }
+    );
+  }
+
+  if (response.status === 404) {
+    throw new RedmineMcpError("NOT_FOUND", "The requested Redmine resource was not found.");
+  }
+
+  if (response.status === 422) {
+    const payload = (await safeJson(response)) as { errors?: string[] } | undefined;
+    throw new RedmineMcpError(
+      "VALIDATION_ERROR",
+      payload?.errors?.join("; ") || "Redmine rejected the request as invalid.",
+      payload
+    );
+  }
+
+  if (!response.ok) {
+    const payload = await safeJson(response);
+    throw new RedmineMcpError(
+      "UPSTREAM_ERROR",
+      `Redmine request failed with ${response.status} ${response.statusText}.`,
+      payload
+    );
+  }
+}
+
+function redirectsToLogin(location: string | null, requestUrl: URL): boolean {
+  if (!location) {
+    return false;
+  }
+  try {
+    return new URL(location, requestUrl).pathname.endsWith("/login");
+  } catch {
+    return false;
+  }
+}
+
+function downloadLimitError(maxBytes: number): RedmineMcpError {
+  return new RedmineMcpError(
+    "VALIDATION_ERROR",
+    `The attachment is larger than the ${formatMegabytes(maxBytes)} download limit.`
+  );
+}
+
+export function formatMegabytes(bytes: number): string {
+  const megabytes = bytes / (1024 * 1024);
+  return `${Number.isInteger(megabytes) ? megabytes : megabytes.toFixed(1)} MB`;
+}
+
+async function readBodyWithLimit(response: Response, maxBytes: number): Promise<Uint8Array> {
+  if (!response.body) {
+    return new Uint8Array(0);
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw downloadLimitError(maxBytes);
+    }
+    chunks.push(value);
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }

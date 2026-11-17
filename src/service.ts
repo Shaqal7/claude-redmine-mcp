@@ -1,5 +1,6 @@
-import { readFile } from "node:fs/promises";
-import { basename, extname } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, extname, join, resolve } from "node:path";
 
 import { RedmineMcpError } from "./errors.js";
 import { normalizeIssueDetail, normalizeIssueSummary } from "./redmine/normalize.js";
@@ -9,11 +10,14 @@ import type {
   AttachmentDescriptor,
   CreateIssueCustomField,
   CreateIssueResult,
+  DownloadAttachmentResult,
+  InlineImageType,
   ListIssuesResult,
   NamedRef,
   NormalizedIssueDetail,
   ProjectIssueMetadata,
   ProjectRef,
+  RedmineAttachment,
   RedmineCustomFieldDefinition,
   RedmineIssue,
   ResolveChainWithAttachmentResult,
@@ -22,7 +26,7 @@ import type {
   SearchIssuesResult,
   UpdateIssueNoteResult
 } from "./types.js";
-import { RedmineClient } from "./redmine/client.js";
+import { RedmineClient, formatMegabytes } from "./redmine/client.js";
 
 type FileReader = (filePath: string) => Promise<Uint8Array>;
 
@@ -45,6 +49,16 @@ export const RELATION_TYPES = [
   "copied_to",
   "copied_from"
 ] as const;
+export const MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024;
+// Base64 of this many bytes is 5 MiB, the Claude API's per-image limit; larger images are saved as files.
+const MAX_INLINE_IMAGE_BYTES = (5 * 1024 * 1024 * 3) / 4;
+const DEFAULT_ATTACHMENT_DIR_NAME = "redmine-mcp-attachments";
+const INLINE_IMAGE_TYPES: ReadonlySet<string> = new Set<InlineImageType>([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp"
+]);
 
 export class RedmineService {
   private readonly policy: ProjectPolicy;
@@ -456,6 +470,99 @@ export class RedmineService {
         issue: normalizeIssueSummary(target.issue, this.client.getBaseUrl())
       }))
     };
+  }
+
+  public async downloadAttachment(input: {
+    issue_id: number;
+    attachment_id: number;
+    save_dir?: string;
+  }): Promise<DownloadAttachmentResult> {
+    const issue = await this.getAuthorizedIssue(input.issue_id);
+    const attachments = issue.attachments ?? [];
+    const meta = attachments.find((candidate) => candidate.id === input.attachment_id);
+    if (!meta) {
+      throw new RedmineMcpError(
+        "NOT_FOUND",
+        `Attachment ${input.attachment_id} is not attached to issue #${issue.id}.`,
+        { attachment_ids_on_issue: attachments.map((candidate) => candidate.id) }
+      );
+    }
+    if (meta.filesize !== undefined && meta.filesize > MAX_DOWNLOAD_BYTES) {
+      throw new RedmineMcpError(
+        "VALIDATION_ERROR",
+        `Attachment ${meta.id} ("${meta.filename}") is ${formatMegabytes(meta.filesize)}, over the ${formatMegabytes(MAX_DOWNLOAD_BYTES)} download limit.`
+      );
+    }
+
+    const { bytes, contentType } = await this.client.downloadAttachment({
+      attachmentId: meta.id,
+      contentUrl: meta.content_url,
+      maxBytes: MAX_DOWNLOAD_BYTES
+    });
+
+    const imageType = sniffImageType(bytes);
+    const inline = imageType !== null && bytes.byteLength <= MAX_INLINE_IMAGE_BYTES;
+    let note: string | undefined;
+    if (imageType !== null && !inline) {
+      note = `The image is ${formatMegabytes(bytes.byteLength)}, too large to show inline, so it was saved as a file. Open it with your file tools.`;
+    } else if (imageType === null && meta.content_type && INLINE_IMAGE_TYPES.has(meta.content_type)) {
+      note = `Redmine labels this attachment ${meta.content_type}, but its bytes are not a PNG, JPEG, GIF or WebP image, so it was saved as a file.`;
+    }
+
+    const saveDir = input.save_dir?.trim();
+    const savedTo = !inline || saveDir ? await this.saveDownloadedAttachment(meta, bytes, saveDir) : null;
+
+    return {
+      attachment: {
+        issue_id: issue.id,
+        id: meta.id,
+        filename: meta.filename,
+        filesize: bytes.byteLength,
+        content_type: meta.content_type ?? contentType,
+        description: meta.description?.trim() || null,
+        author: meta.author?.name ?? null,
+        created_on: meta.created_on ?? null,
+        url: meta.content_url ?? null
+      },
+      delivered_as: inline ? "image" : "file",
+      saved_to: savedTo,
+      ...(note ? { note } : {}),
+      ...(inline && imageType ? { image: { data: Buffer.from(bytes).toString("base64"), mime_type: imageType } } : {})
+    };
+  }
+
+  /** Writes <id>-<name> into saveDir (default: the system temp dir); never overwrites a different file. */
+  private async saveDownloadedAttachment(
+    meta: RedmineAttachment,
+    bytes: Uint8Array,
+    saveDir: string | undefined
+  ): Promise<string> {
+    const directory = saveDir ? resolve(saveDir) : join(tmpdir(), DEFAULT_ATTACHMENT_DIR_NAME);
+    const target = join(directory, `${meta.id}-${localAttachmentFilename(meta.filename)}`);
+
+    try {
+      await mkdir(directory, { recursive: true });
+      await writeFile(target, bytes, { flag: "wx" });
+      return target;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw new RedmineMcpError("VALIDATION_ERROR", `Unable to save the attachment to "${target}": ${reasonOf(error)}.`);
+      }
+    }
+
+    let existing: Uint8Array;
+    try {
+      existing = await readFile(target);
+    } catch (error) {
+      throw new RedmineMcpError("VALIDATION_ERROR", `Unable to save the attachment to "${target}": ${reasonOf(error)}.`);
+    }
+    if (Buffer.compare(existing, bytes) === 0) {
+      return target;
+    }
+    throw new RedmineMcpError(
+      "VALIDATION_ERROR",
+      `"${target}" already exists with different content; it was left untouched. Pass another save_dir.`
+    );
   }
 
   private async readAttachment(filePath: string): Promise<{
@@ -1264,6 +1371,31 @@ const CONTENT_TYPE_BY_EXTENSION: Record<string, string> = {
 
 function contentTypeForExtension(extension: string): string {
   return CONTENT_TYPE_BY_EXTENSION[extension.toLowerCase()] ?? "application/octet-stream";
+}
+
+function sniffImageType(bytes: Uint8Array): InlineImageType | null {
+  const startsWith = (signature: number[], offset = 0) =>
+    bytes.byteLength >= offset + signature.length && signature.every((byte, index) => bytes[offset + index] === byte);
+
+  if (startsWith([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) {
+    return "image/png";
+  }
+  if (startsWith([0xff, 0xd8, 0xff])) {
+    return "image/jpeg";
+  }
+  if (startsWith([0x47, 0x49, 0x46, 0x38])) {
+    return "image/gif";
+  }
+  if (startsWith([0x52, 0x49, 0x46, 0x46]) && startsWith([0x57, 0x45, 0x42, 0x50], 8)) {
+    return "image/webp";
+  }
+  return null;
+}
+
+/** A single path segment safe on Windows and POSIX, whatever the attachment's name. */
+function localAttachmentFilename(filename: string): string {
+  const name = redmineStoredFilename(filename).replace(/[\u0000-\u001f]/g, "_");
+  return name === "" || name === "." || name === ".." ? "attachment" : name;
 }
 
 /** Redmine's Attachment#sanitize_filename: the name it stores, and the one a description has to embed. */

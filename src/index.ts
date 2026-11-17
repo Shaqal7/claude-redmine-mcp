@@ -52,6 +52,16 @@ server.registerTool("get_issue", {
   }
 }, handlers.getIssue);
 
+server.registerTool("download_attachment", {
+  description:
+    "Download one attachment of an issue in an allowed Redmine project so you can look at it (read-only: nothing is written to Redmine). Get attachment_id from get_issue; the attachment must belong to issue_id. A PNG, JPEG, GIF or WebP image up to 3.75 MB comes back as an image you see directly, with its name, size, author and date (it is also saved when save_dir is given). Any other file, or a larger image, is saved as <attachment_id>-<filename> under save_dir (on the MCP server's filesystem; default: a redmine-mcp-attachments folder in the system temp directory) and only its path is returned: open it with your file tools. An existing file with different content is never overwritten. Attachments over 10 MB are refused.",
+  inputSchema: {
+    issue_id: z.number().int().positive(),
+    attachment_id: z.number().int().positive(),
+    save_dir: z.string().min(1).optional()
+  }
+}, handlers.downloadAttachment);
+
 server.registerTool("update_issue_note", {
   description:
     "Replace the text of an existing note (journal) on a Redmine issue. Get journal_id from get_issue. Requires Redmine 5.0+ and edit-notes permission. Only call this after explicit user confirmation.",
