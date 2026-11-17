@@ -11,6 +11,8 @@ export interface AppConfig {
   allowedProjects: string[];
   defaultExternalProjects: string[];
   timeoutMs: number;
+  /** Absolute; download_attachment saves only in this folder or its subfolders (REDMINE_DOWNLOAD_DIR). */
+  downloadDir: string;
 }
 
 export interface NamedRef {
